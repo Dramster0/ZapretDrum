@@ -26,7 +26,7 @@ GITHUB_RELEASES_PAGE = (
 
 # --- репозиторий САМОГО ZapretDrum (для самообновления приложения) ---
 # ЗАМЕНИТЕ на свой логин/репозиторий после того, как создадите его на GitHub!
-APPUPDATE_GITHUB_OWNER = "YOUR_GITHUB_USERNAME"
+APPUPDATE_GITHUB_OWNER = "Dramster0"
 APPUPDATE_GITHUB_REPO = "ZapretDrum"
 APPUPDATE_API_LATEST_RELEASE = (
     f"https://api.github.com/repos/{APPUPDATE_GITHUB_OWNER}/{APPUPDATE_GITHUB_REPO}/releases/latest"
