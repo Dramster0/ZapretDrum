@@ -31,6 +31,7 @@ from core import user_lists
 from core import app_updater
 from core import tg_manager
 from core import tg_installer
+from core import conflict_detector
 from core.app_version import get_app_version
 from core.paths import (
     APP_DATA_DIR,
@@ -156,6 +157,114 @@ def _show_changelog_dialog(parent, entries: list) -> None:
     layout.addWidget(footer)
 
     dialog.exec()
+
+
+def _show_release_notes_dialog(parent, version: str, published_at: str, notes: str) -> None:
+    """
+    Показывает описание ОДНОГО конкретного релиза (то, что ждёт человека,
+    если он нажмёт "Обновить") - чтобы обновляться не вслепую. В отличие
+    от _show_changelog_dialog (полная история версий), тут только та
+    версия, до которой сейчас предлагается обновиться.
+    """
+    dialog, layout = _make_frameless_dialog(parent, "Что нового в этой версии?", 480, 420)
+
+    view = QTextEdit()
+    view.setObjectName("changelogView")
+    view.setReadOnly(True)
+
+    date = published_at[:10]
+    heading = f"## v{version}" + (f"  •  {date}" if date else "")
+    body = notes.strip() or "_Автор не оставил описания изменений для этой версии._"
+    view.setMarkdown(f"{heading}\n\n{body}")
+    layout.addWidget(view, 1)
+
+    dialog.exec()
+
+
+def _show_zapret_conflict_dialog(parent, report: "conflict_detector.ConflictReport") -> str:
+    """
+    Показывает найденную "постороннюю" установку zapret (не через
+    ZapretDrum) и предлагает её удалить. Возвращает:
+      "deleted" - пользователь нажал "Удалить всё" (удаление уже выполнено);
+      "skipped" - пользователь попросил больше не спрашивать;
+      "later"   - отложил (спросим ещё раз при следующем запуске).
+    """
+    dialog, layout = _make_frameless_dialog(parent, "Обнаружена другая установка zapret", 540, 440)
+
+    intro = QLabel(
+        "Похоже, на этом компьютере уже есть zapret-discord-youtube, "
+        "установленный отдельно от ZapretDrum. Это может привести к "
+        "конфликтам (например, не получится включить «Установить как "
+        "службу», если служба с таким именем уже занята) и просто "
+        "захламляет диск. Рекомендуем удалить найденное - ZapretDrum сам "
+        "скачает и будет управлять своей копией на вкладке «Обновление»."
+    )
+    intro.setWordWrap(True)
+    layout.addWidget(intro)
+
+    lines: list[str] = []
+    for proc in report.processes:
+        lines.append(f"Запущенный процесс: {proc.exe_path}  (PID {proc.pid})")
+    for svc in report.services:
+        lines.append(f'Служба Windows: "{svc.name}"  →  {svc.binary_path}')
+    for folder in report.folders:
+        lines.append(f"Папка с файлами: {folder}")
+
+    found_view = QTextEdit()
+    found_view.setObjectName("logView")
+    found_view.setReadOnly(True)
+    found_view.setPlainText("\n".join(lines))
+    found_view.setFixedHeight(150)
+    layout.addWidget(found_view)
+
+    layout.addStretch(1)
+
+    btn_row = QHBoxLayout()
+    delete_btn = QPushButton("Удалить всё и продолжить")
+    delete_btn.setObjectName("dangerButton")
+    skip_btn = QPushButton("Не спрашивать больше")
+    skip_btn.setObjectName("secondaryButton")
+    later_btn = QPushButton("Напомнить в следующий раз")
+    later_btn.setObjectName("secondaryButton")
+    btn_row.addWidget(delete_btn)
+    btn_row.addWidget(skip_btn)
+    btn_row.addWidget(later_btn)
+    layout.addLayout(btn_row)
+
+    result = {"choice": "later"}
+
+    def do_delete() -> None:
+        if not _confirm(
+            dialog,
+            "Подтверждение удаления",
+            "Найденные процессы, службы и папки будут остановлены и удалены "
+            "безвозвратно. Продолжить?",
+            ok_text="Удалить",
+            danger=True,
+        ):
+            return
+        delete_btn.setEnabled(False)
+        skip_btn.setEnabled(False)
+        later_btn.setEnabled(False)
+        log = conflict_detector.resolve(report, delete_folders=True)
+        result["choice"] = "deleted"
+        dialog.accept()
+        _show_log_dialog(parent, "Результат очистки", "\n".join(log) or "Нечего было удалять.")
+
+    def do_skip() -> None:
+        result["choice"] = "skipped"
+        dialog.accept()
+
+    def do_later() -> None:
+        result["choice"] = "later"
+        dialog.accept()
+
+    delete_btn.clicked.connect(do_delete)
+    skip_btn.clicked.connect(do_skip)
+    later_btn.clicked.connect(do_later)
+
+    dialog.exec()
+    return result["choice"]
 
 
 def _confirm(
@@ -1393,11 +1502,16 @@ class SettingsPage(QWidget):
         self.check_app_update_btn = QPushButton("Проверить обновления ZapretDrum")
         self.check_app_update_btn.setObjectName("secondaryButton")
         self.check_app_update_btn.clicked.connect(self._check_app_update)
+        self.app_update_details_btn = QPushButton("Подробнее")
+        self.app_update_details_btn.setObjectName("secondaryButton")
+        self.app_update_details_btn.setEnabled(False)
+        self.app_update_details_btn.clicked.connect(self._show_app_update_details)
         self.install_app_update_btn = QPushButton("Обновить ZapretDrum")
         self.install_app_update_btn.setObjectName("primaryButton")
         self.install_app_update_btn.setEnabled(False)
         self.install_app_update_btn.clicked.connect(self._install_app_update)
         app_update_btn_row.addWidget(self.check_app_update_btn)
+        app_update_btn_row.addWidget(self.app_update_details_btn)
         app_update_btn_row.addWidget(self.install_app_update_btn)
         app_update_btn_row.addStretch(1)
         update_card.body.addLayout(app_update_btn_row)
@@ -1420,6 +1534,17 @@ class SettingsPage(QWidget):
         admin_text += "есть ✅" if _is_admin() else "нет ⚠️ (нужны для управления winws.exe)"
         admin_card.body.addWidget(QLabel(admin_text))
         root.addWidget(admin_card)
+
+        conflict_card = Card()
+        conflict_card.body.addWidget(QLabel(
+            "Проверка на другую установку zapret (не через ZapretDrum) - "
+            "процессы, службы Windows и папки с файлами, которые могут конфликтовать."
+        ))
+        conflict_btn = QPushButton("Проверить на другую установку zapret")
+        conflict_btn.setObjectName("secondaryButton")
+        conflict_btn.clicked.connect(self._check_conflicts_manually)
+        conflict_card.body.addWidget(conflict_btn)
+        root.addWidget(conflict_card)
 
         danger_card = Card()
         danger_card.body.addWidget(QLabel("Опасная зона"))
@@ -1467,14 +1592,22 @@ class SettingsPage(QWidget):
         if release is None:
             self._pending_app_release = None
             self.install_app_update_btn.setEnabled(False)
+            self.app_update_details_btn.setEnabled(False)
             self.app_update_status_label.setText("У вас последняя версия.")
             return
 
         self._pending_app_release = release
         self.install_app_update_btn.setEnabled(True)
+        self.app_update_details_btn.setEnabled(True)
         self.app_update_status_label.setText(
             f"Доступна новая версия: {release.version} (сейчас {get_app_version()})"
         )
+
+    def _show_app_update_details(self) -> None:
+        if self._pending_app_release is None:
+            return
+        release = self._pending_app_release
+        _show_release_notes_dialog(self, release.version, release.published_at, release.notes)
 
     def _on_app_update_error(self, message: str) -> None:
         self.check_app_update_btn.setEnabled(True)
@@ -1529,6 +1662,19 @@ class SettingsPage(QWidget):
                 process_manager.stop_all()
             shutil.rmtree(ZAPRET_DIR, ignore_errors=True)
             self.main_window.go_to("update")
+
+    def _check_conflicts_manually(self) -> None:
+        if not process_manager.IS_WINDOWS:
+            QMessageBox.information(self, "Недоступно", "Эта проверка доступна только на Windows.")
+            return
+        report = conflict_detector.detect()
+        if report.is_empty():
+            QMessageBox.information(
+                self, "Всё чисто",
+                "Посторонней установки zapret (не через ZapretDrum) не найдено.",
+            )
+            return
+        _show_zapret_conflict_dialog(self, report)
 
     def _delete_zapret_completely(self) -> None:
         confirm = _confirm(
@@ -1934,6 +2080,32 @@ class MainWindow(QMainWindow):
 
         if not is_installed():
             self.go_to("update")
+
+        QTimer.singleShot(600, self._check_zapret_conflicts)
+
+    # ------------------------------------------------------------------ #
+    def _check_zapret_conflicts(self) -> None:
+        """
+        Разово (за сеанс, и не больше раза за установку - см.
+        state.zapret_conflict_dismissed) проверяет, нет ли на компьютере
+        zapret-discord-youtube, установленного отдельно от ZapretDrum, и
+        предлагает его удалить, чтобы не было конфликтов служб/процессов.
+        """
+        if not process_manager.IS_WINDOWS:
+            return
+        state = load_state()
+        if state.zapret_conflict_dismissed:
+            return
+
+        report = conflict_detector.detect()
+        if report.is_empty():
+            return
+
+        choice = _show_zapret_conflict_dialog(self, report)
+        if choice in ("deleted", "skipped"):
+            state = load_state()
+            state.zapret_conflict_dismissed = True
+            save_state(state)
 
     # ------------------------------------------------------------------ #
     def go_to(self, key: str, auto_start: bool = False) -> None:

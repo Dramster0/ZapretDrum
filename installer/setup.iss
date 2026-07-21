@@ -52,13 +52,54 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 ; (нужно для управления winws.exe/WinDivert), а обычный CreateProcess не
 ; умеет запускать такие файлы напрямую - только через ShellExecute, отсюда
 ; и флаг. Без него после установки будет ошибка "CreateProcess: код 740".
-; Флага skipifsilent НЕТ специально: при самообновлении из приложения
-; установка идёт в тихом режиме (/VERYSILENT), и приложению нужно само
-; перезапуститься после - если добавить skipifsilent, тихая установка
-; его пропустит, и пользователю пришлось бы открывать ZapretDrum вручную.
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall shellexec
+; skipifsilent - эта галочка "Launch ZapretDrum" нужна только при обычной,
+; интерактивной установке. Тихую самообновляющуюся установку (/VERYSILENT)
+; она тоже могла бы запустить, но без права на повторную попытку - если
+; в этот момент антивирус ещё сканирует свежеустановленный exe, запуск
+; падает с ошибкой вида "Failed to load Python DLL" и человеку приходится
+; открывать программу вручную. Поэтому для тихого запуска ниже есть
+; отдельная логика в CurStepChanged - с паузой и повторными попытками.
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall shellexec skipifsilent
 
 [Code]
+// Перезапуск ZapretDrum после ТИХОЙ установки (самообновление из самого
+// приложения, core.app_updater.download_and_launch_update -> /VERYSILENT).
+// Проблема, которую это чинит: если запустить свежеустановленный exe
+// сразу же, антивирус (чаще всего встроенный Защитник Windows) иногда
+// ещё сканирует его в этот самый момент, и PyInstaller-бутлоадер не может
+// распаковать/загрузить свою DLL ("Failed to load Python DLL ... LoadLibrary:
+// не найден указанный модуль") - хотя сам файл на диске совершенно цел
+// (что и подтвердилось: повторный запуск вручную через минуту сработал).
+// Решение - не полагаться на единственную попытку сразу: подождать и,
+// если не получилось, попробовать ещё раз (с увеличивающейся паузой).
+procedure LaunchAfterSilentUpdate();
+var
+  ResultCode: Integer;
+  Attempt: Integer;
+  Launched: Boolean;
+begin
+  Launched := False;
+  for Attempt := 1 to 4 do
+  begin
+    Sleep(1000 * Attempt);  // 1с, 2с, 3с, 4с - даём антивирусу "остыть"
+    if ShellExec('open', ExpandConstant('{app}\{#MyAppExeName}'), '', '',
+      SW_SHOWNORMAL, ewNoWait, ResultCode) then
+    begin
+      Launched := True;
+      Break;
+    end;
+  end;
+  // Если все попытки не удались - молча сдаёмся: пользователь всё равно
+  // увидит, что ZapretDrum не открылся, и запустит его сам через ярлык
+  // (сама установка при этом прошла успешно, файлы на месте).
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if (CurStep = ssDone) and WizardSilent() then
+    LaunchAfterSilentUpdate();
+end;
+
 // Полная деинсталляция: помимо файлов, которые ставил сам инсталлятор
 // (это Inno Setup делает автоматически), нужно ещё:
 //  1. остановить и удалить службу Windows "zapret" / "WinDivert", если она

@@ -47,6 +47,7 @@ class AppReleaseInfo:
     setup_url: str
     setup_name: str
     notes: str
+    published_at: str = ""
 
 
 def _headers() -> dict:
@@ -123,6 +124,7 @@ def check_for_app_update() -> AppReleaseInfo | None:
         setup_url=setup_asset["browser_download_url"],
         setup_name=setup_asset["name"],
         notes=data.get("body", "") or "",
+        published_at=data.get("published_at", "") or "",
     )
 
 

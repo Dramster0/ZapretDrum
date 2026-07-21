@@ -24,6 +24,7 @@ class AppState:
     last_test_results: list[dict[str, Any]] = field(default_factory=list)
     autostart_enabled: bool = False
     tg_installed_version: Optional[str] = None
+    zapret_conflict_dismissed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
