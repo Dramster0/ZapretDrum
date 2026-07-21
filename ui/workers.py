@@ -5,6 +5,8 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from core import process_manager
 from core import service_manager
 from core import app_updater
+from core import tg_manager
+from core import tg_installer
 from core.installer import install_or_update, fetch_all_releases, InstallerError, ReleaseInfo
 from core.strategies import Strategy
 from core.tester import run_auto_test, StrategyTestResult
@@ -172,6 +174,70 @@ class DownloadAppUpdateWorker(QThread):
             )
             self.finished_ok.emit()
         except app_updater.AppUpdateError as exc:
+            self.finished_error.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            self.finished_error.emit(f"Непредвиденная ошибка: {exc}")
+
+
+class TgInstallWorker(QThread):
+    progress = pyqtSignal(str, float)
+    finished_ok = pyqtSignal(object)   # TgReleaseInfo
+    finished_error = pyqtSignal(str)
+
+    def __init__(self, release=None):
+        super().__init__()
+        self.release = release
+
+    def run(self) -> None:
+        try:
+            release = tg_installer.install_or_update(
+                progress_cb=lambda msg, frac: self.progress.emit(msg, frac),
+                release=self.release,
+            )
+            self.finished_ok.emit(release)
+        except tg_installer.TgInstallerError as exc:
+            self.finished_error.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            self.finished_error.emit(f"Непредвиденная ошибка: {exc}")
+
+
+class TgFetchReleasesWorker(QThread):
+    finished_ok = pyqtSignal(list)   # list[TgReleaseInfo]
+    finished_error = pyqtSignal(str)
+
+    def run(self) -> None:
+        try:
+            releases = tg_installer.fetch_all_releases(limit=30)
+            self.finished_ok.emit(releases)
+        except tg_installer.TgInstallerError as exc:
+            self.finished_error.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            self.finished_error.emit(f"Непредвиденная ошибка: {exc}")
+
+
+class TgStartWorker(QThread):
+    finished_ok = pyqtSignal()
+    finished_error = pyqtSignal(str)
+
+    def run(self) -> None:
+        try:
+            tg_manager.start()
+            self.finished_ok.emit()
+        except tg_manager.TgManagerError as exc:
+            self.finished_error.emit(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            self.finished_error.emit(f"Непредвиденная ошибка: {exc}")
+
+
+class TgStopWorker(QThread):
+    finished_ok = pyqtSignal()
+    finished_error = pyqtSignal(str)
+
+    def run(self) -> None:
+        try:
+            tg_manager.stop()
+            self.finished_ok.emit()
+        except tg_manager.TgManagerError as exc:
             self.finished_error.emit(str(exc))
         except Exception as exc:  # noqa: BLE001
             self.finished_error.emit(f"Непредвиденная ошибка: {exc}")

@@ -23,6 +23,7 @@ class AppState:
     favorite_strategy: Optional[str] = None
     last_test_results: list[dict[str, Any]] = field(default_factory=list)
     autostart_enabled: bool = False
+    tg_installed_version: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

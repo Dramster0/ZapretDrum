@@ -64,11 +64,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Если релиз с этим тегом уже создан вручную на сайте (обычный
-          # случай - там удобнее писать заголовок/описание) - просто
-          # прикрепляем к нему собранный файл. Если релиза ещё нет
-          # (например, тег запушен через git без создания релиза на
-          # сайте) - создаём релиз с нуля.
           if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
             gh release upload "${{ github.ref_name }}" \
               "installer/Output/ZapretDrum-Setup.exe" --clobber

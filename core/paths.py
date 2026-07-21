@@ -26,7 +26,7 @@ GITHUB_RELEASES_PAGE = (
 
 # --- репозиторий САМОГО ZapretDrum (для самообновления приложения) ---
 # ЗАМЕНИТЕ на свой логин/репозиторий после того, как создадите его на GitHub!
-APPUPDATE_GITHUB_OWNER = "YOUR_GITHUB_USERNAME"
+APPUPDATE_GITHUB_OWNER = "Dramster0"
 APPUPDATE_GITHUB_REPO = "ZapretDrum"
 APPUPDATE_API_LATEST_RELEASE = (
     f"https://api.github.com/repos/{APPUPDATE_GITHUB_OWNER}/{APPUPDATE_GITHUB_REPO}/releases/latest"
@@ -40,6 +40,31 @@ APPUPDATE_RELEASES_PAGE = (
 
 # Куда открывать "Нашли баг?" / "By Dramster"
 DEVELOPER_TELEGRAM_URL = "https://t.me/Dramster1"
+
+# --- tg-ws-proxy (Flowseal/tg-ws-proxy) - отдельная программа того же автора ---
+TG_GITHUB_OWNER = "Flowseal"
+TG_GITHUB_REPO = "tg-ws-proxy"
+TG_GITHUB_API_LATEST_RELEASE = (
+    f"https://api.github.com/repos/{TG_GITHUB_OWNER}/{TG_GITHUB_REPO}/releases/latest"
+)
+TG_GITHUB_API_ALL_RELEASES = (
+    f"https://api.github.com/repos/{TG_GITHUB_OWNER}/{TG_GITHUB_REPO}/releases"
+)
+TG_GITHUB_RELEASES_PAGE = (
+    f"https://github.com/{TG_GITHUB_OWNER}/{TG_GITHUB_REPO}/releases"
+)
+
+# Имя файла, под которым мы всегда сохраняем exe локально (независимо от
+# конкретного имени ассета в релизе) - так процесс всегда предсказуемо
+# называется на диске, и его легко искать по имени в psutil.
+TG_EXE_NAME = "TgWsProxy_windows.exe"
+
+# Скрипт автозагрузки кладём в личную папку автозагрузки пользователя
+# (не в общесистемную) - для неё не нужны права администратора, в отличие
+# от службы Windows, которая тут в принципе не подходит: tg-ws-proxy -
+# трей-приложение с собственным окном/иконкой, а служба Windows не имеет
+# доступа к рабочему столу пользователя и не сможет показать трей.
+TG_AUTOSTART_SCRIPT_NAME = "ZapretDrum-TgWsProxy.vbs"
 
 
 def _app_data_root() -> Path:
@@ -56,6 +81,19 @@ DOWNLOAD_TMP_DIR = APP_DATA_DIR / "tmp"        # временные архивы
 BACKUP_DIR = APP_DATA_DIR / "user_lists_backup"  # бэкап пользовательских списков при обновлении
 STATE_FILE = APP_DATA_DIR / "state.json"
 LOG_FILE = APP_DATA_DIR / "zapret_gui.log"
+
+TG_DIR = APP_DATA_DIR / "tg-ws-proxy"          # сюда кладём exe и его portable-данные
+TG_EXE_PATH = TG_DIR / TG_EXE_NAME
+
+
+def windows_startup_folder() -> Path:
+    """
+    Личная папка автозагрузки текущего пользователя Windows
+    (то же самое, что открывается по `shell:startup`). Работает без прав
+    администратора - в отличие от общесистемной автозагрузки.
+    """
+    base = os.getenv("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(base) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
 
 # Файлы/папки, которые сохраняем при обновлении (пользовательские правки)
 USER_LIST_NAMES = [
@@ -76,7 +114,7 @@ NON_STRATEGY_BAT_HINTS = (
 
 
 def ensure_dirs() -> None:
-    for d in (APP_DATA_DIR, DOWNLOAD_TMP_DIR, BACKUP_DIR):
+    for d in (APP_DATA_DIR, DOWNLOAD_TMP_DIR, BACKUP_DIR, TG_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

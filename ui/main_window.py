@@ -29,12 +29,16 @@ from core import process_manager
 from core import service_manager
 from core import user_lists
 from core import app_updater
+from core import tg_manager
+from core import tg_installer
 from core.app_version import get_app_version
 from core.paths import (
     APP_DATA_DIR,
     ZAPRET_DIR,
     GITHUB_RELEASES_PAGE,
     DEVELOPER_TELEGRAM_URL,
+    TG_DIR,
+    TG_GITHUB_RELEASES_PAGE,
     resource_path,
 )
 from core.installer import is_installed, ReleaseInfo
@@ -43,7 +47,7 @@ from core.strategies import discover_strategies, Strategy, find_strategy
 from core.updater import check_for_updates, UpdateCheckResult
 
 from ui.theme import STYLESHEET, TEXT_SECONDARY, SUCCESS, DANGER, BORDER, ACCENT
-from ui.widgets import Card, StrategyRow, PowerButton, make_avatar, nav_button, MainTitleBar, DialogTitleBar, ResizeGrip
+from ui.widgets import Card, StrategyRow, PowerButton, StatusDot, make_avatar, nav_button, MainTitleBar, DialogTitleBar, ResizeGrip
 from ui.workers import (
     InstallWorker,
     FetchReleasesWorker,
@@ -55,6 +59,10 @@ from ui.workers import (
     CheckAppUpdateWorker,
     DownloadAppUpdateWorker,
     FetchChangelogWorker,
+    TgInstallWorker,
+    TgFetchReleasesWorker,
+    TgStartWorker,
+    TgStopWorker,
 )
 
 
@@ -755,12 +763,264 @@ class AutoTestPage(QWidget):
 # --------------------------------------------------------------------------- #
 # Обновление
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Telegram (tg-ws-proxy)
+# --------------------------------------------------------------------------- #
+class TelegramPage(QWidget):
+    """
+    Отдельная вкладка для tg-ws-proxy (Flowseal/tg-ws-proxy) - локального
+    MTProto-прокси, ускоряющего Telegram. Это отдельная программа того же
+    автора: скачивание/установка идёт через core.tg_installer, запуск и
+    статус - через core.tg_manager. Обновления самого tg-ws-proxy делаются
+    на странице «Обновление» (отдельным блоком) - здесь только состояние,
+    запуск/остановка и автозапуск.
+    """
+
+    def __init__(self, main_window: "MainWindow"):
+        super().__init__()
+        self.main_window = main_window
+        self.install_worker: TgInstallWorker | None = None
+        self.start_worker: TgStartWorker | None = None
+        self.stop_worker: TgStopWorker | None = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(32, 28, 32, 28)
+        root.setSpacing(16)
+
+        title = QLabel("Telegram")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel(
+            "tg-ws-proxy - локальный MTProto-прокси для ускорения Telegram Desktop "
+            f"({TG_GITHUB_RELEASES_PAGE})"
+        )
+        subtitle.setObjectName("pageSubtitle")
+        subtitle.setWordWrap(True)
+        root.addWidget(title)
+        root.addWidget(subtitle)
+
+        # --- карточка "ещё не установлено" --- #
+        self.install_card = Card()
+        install_label = QLabel("tg-ws-proxy ещё не установлен.")
+        install_label.setStyleSheet("font-weight: 600;")
+        install_hint = QLabel(
+            "Нажмите кнопку ниже, чтобы скачать последнюю версию с GitHub - "
+            "отдельно скачивать и распаковывать ничего не нужно."
+        )
+        install_hint.setWordWrap(True)
+        install_hint.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        self.install_button = QPushButton("Скачать и установить tg-ws-proxy")
+        self.install_button.setObjectName("primaryButton")
+        self.install_button.clicked.connect(self._on_install_clicked)
+
+        self.install_progress_bar = QProgressBar()
+        self.install_progress_bar.setRange(0, 100)
+        self.install_progress_bar.setVisible(False)
+        self.install_progress_label = QLabel("")
+        self.install_progress_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        self.install_progress_label.setVisible(False)
+
+        self.install_card.body.addWidget(install_label)
+        self.install_card.body.addWidget(install_hint)
+        self.install_card.body.addWidget(self.install_progress_bar)
+        self.install_card.body.addWidget(self.install_progress_label)
+        self.install_card.body.addWidget(self.install_button)
+        root.addWidget(self.install_card)
+
+        # --- карточка статуса/управления (когда установлен) --- #
+        self.status_card = Card()
+
+        status_row = QHBoxLayout()
+        self.status_dot = StatusDot()
+        status_row.addWidget(self.status_dot)
+        self.status_label = QLabel("Остановлен")
+        self.status_label.setStyleSheet("font-weight: 600;")
+        status_row.addWidget(self.status_label)
+        status_row.addStretch(1)
+        self.status_card.body.addLayout(status_row)
+
+        self.version_label = QLabel("Установленная версия: —")
+        self.version_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        self.status_card.body.addWidget(self.version_label)
+
+        control_row = QHBoxLayout()
+        self.start_button = QPushButton("Запустить")
+        self.start_button.setObjectName("primaryButton")
+        self.start_button.clicked.connect(self._on_start_clicked)
+        self.stop_button = QPushButton("Остановить")
+        self.stop_button.setObjectName("dangerButton")
+        self.stop_button.clicked.connect(self._on_stop_clicked)
+        control_row.addWidget(self.start_button)
+        control_row.addWidget(self.stop_button)
+        control_row.addStretch(1)
+        self.status_card.body.addLayout(control_row)
+        root.addWidget(self.status_card)
+
+        # --- карточка автозапуска --- #
+        autostart_card = Card()
+        autostart_title = QLabel("Автозапуск")
+        autostart_title.setStyleSheet("font-weight: 600;")
+        autostart_hint = QLabel(
+            "tg-ws-proxy - трей-приложение, а не консольная стратегия, поэтому "
+            "автозапуск делается не службой Windows (у службы нет доступа к "
+            "рабочему столу и трею), а через папку автозагрузки Windows: "
+            "программа запускается скрыто при входе в систему, вместе с "
+            "остальными трей-приложениями."
+        )
+        autostart_hint.setWordWrap(True)
+        autostart_hint.setStyleSheet(f"color: {TEXT_SECONDARY};")
+
+        autostart_row = QHBoxLayout()
+        self.autostart_status_label = QLabel("Автозапуск: выключен")
+        autostart_row.addWidget(self.autostart_status_label)
+        autostart_row.addStretch(1)
+        self.autostart_enable_btn = QPushButton("Включить автозапуск")
+        self.autostart_enable_btn.setObjectName("secondaryButton")
+        self.autostart_enable_btn.clicked.connect(self._on_enable_autostart)
+        self.autostart_disable_btn = QPushButton("Выключить автозапуск")
+        self.autostart_disable_btn.setObjectName("secondaryButton")
+        self.autostart_disable_btn.clicked.connect(self._on_disable_autostart)
+        autostart_row.addWidget(self.autostart_enable_btn)
+        autostart_row.addWidget(self.autostart_disable_btn)
+
+        autostart_card.body.addWidget(autostart_title)
+        autostart_card.body.addWidget(autostart_hint)
+        autostart_card.body.addLayout(autostart_row)
+        root.addWidget(autostart_card)
+
+        # --- вспомогательные ссылки --- #
+        links_row = QHBoxLayout()
+        open_folder_btn = QPushButton("Открыть папку данных")
+        open_folder_btn.setObjectName("secondaryButton")
+        open_folder_btn.clicked.connect(lambda: _open_folder(TG_DIR))
+        links_row.addWidget(open_folder_btn)
+        links_row.addStretch(1)
+        root.addLayout(links_row)
+
+        note = QLabel(
+            "После запуска настройте подключение Telegram Desktop через "
+            "трей-меню самого tg-ws-proxy (значок появится рядом с часами): "
+            "пункты «Открыть в Telegram» или «Скопировать ссылку», либо "
+            "вручную по инструкции из репозитория."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        root.addWidget(note)
+        root.addStretch(1)
+
+        self.refresh()
+
+    # ------------------------------------------------------------------ #
+    def refresh(self) -> None:
+        installed = tg_manager.is_installed()
+        self.install_card.setVisible(not installed)
+        self.status_card.setVisible(installed)
+
+        if not installed:
+            return
+
+        state = load_state()
+        version = state.tg_installed_version or "неизвестна"
+        self.version_label.setText(f"Установленная версия: {version}")
+
+        running = tg_manager.is_running() if tg_manager.IS_WINDOWS else False
+        self.status_dot.set_active(running)
+        self.status_label.setText("Запущен" if running else "Остановлен")
+        self.start_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
+
+        autostart_on = tg_manager.is_autostart_enabled()
+        self.autostart_status_label.setText(
+            "Автозапуск: включён" if autostart_on else "Автозапуск: выключен"
+        )
+        self.autostart_enable_btn.setEnabled(not autostart_on)
+        self.autostart_disable_btn.setEnabled(autostart_on)
+
+    # ------------------------------------------------------------------ #
+    def _on_install_clicked(self) -> None:
+        self.install_button.setEnabled(False)
+        self.install_progress_bar.setVisible(True)
+        self.install_progress_label.setVisible(True)
+        self.install_progress_bar.setValue(0)
+        self.main_window.set_busy(True, "Устанавливаю tg-ws-proxy...")
+
+        self.install_worker = TgInstallWorker()
+        self.install_worker.progress.connect(self._on_install_progress)
+        self.install_worker.finished_ok.connect(self._on_install_finished)
+        self.install_worker.finished_error.connect(self._on_install_error)
+        self.install_worker.start()
+
+    def _on_install_progress(self, msg: str, frac: float) -> None:
+        self.install_progress_label.setText(msg)
+        self.install_progress_bar.setValue(int(frac * 100))
+
+    def _on_install_finished(self, release) -> None:
+        state = load_state()
+        state.tg_installed_version = release.tag_name
+        save_state(state)
+
+        self.install_button.setEnabled(True)
+        self.main_window.set_busy(False)
+        self.refresh()
+        QMessageBox.information(
+            self, "Готово", f"tg-ws-proxy установлен, версия {release.tag_name}."
+        )
+
+    def _on_install_error(self, message: str) -> None:
+        self.install_button.setEnabled(True)
+        self.main_window.set_busy(False)
+        QMessageBox.warning(self, "Ошибка установки", message)
+
+    # ------------------------------------------------------------------ #
+    def _on_start_clicked(self) -> None:
+        self.start_button.setEnabled(False)
+        self.main_window.set_busy(True, "Запускаю tg-ws-proxy...")
+        self.start_worker = TgStartWorker()
+        self.start_worker.finished_ok.connect(self._on_start_ok)
+        self.start_worker.finished_error.connect(self._on_worker_error)
+        self.start_worker.start()
+
+    def _on_start_ok(self) -> None:
+        self.main_window.set_busy(False)
+        self.refresh()
+
+    def _on_stop_clicked(self) -> None:
+        self.stop_button.setEnabled(False)
+        self.main_window.set_busy(True, "Останавливаю tg-ws-proxy...")
+        self.stop_worker = TgStopWorker()
+        self.stop_worker.finished_ok.connect(self._on_stop_ok)
+        self.stop_worker.finished_error.connect(self._on_worker_error)
+        self.stop_worker.start()
+
+    def _on_stop_ok(self) -> None:
+        self.main_window.set_busy(False)
+        self.refresh()
+
+    def _on_worker_error(self, message: str) -> None:
+        self.main_window.set_busy(False)
+        self.refresh()
+        QMessageBox.warning(self, "Ошибка", message)
+
+    # ------------------------------------------------------------------ #
+    def _on_enable_autostart(self) -> None:
+        try:
+            tg_manager.enable_autostart()
+        except tg_manager.TgManagerError as exc:
+            QMessageBox.warning(self, "Ошибка", str(exc))
+        self.refresh()
+
+    def _on_disable_autostart(self) -> None:
+        tg_manager.disable_autostart()
+        self.refresh()
+
+
 class UpdatePage(QWidget):
     def __init__(self, main_window: "MainWindow"):
         super().__init__()
         self.main_window = main_window
         self.install_worker: InstallWorker | None = None
         self.fetch_releases_worker: FetchReleasesWorker | None = None
+        self.tg_install_worker: TgInstallWorker | None = None
+        self.tg_fetch_releases_worker: TgFetchReleasesWorker | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(32, 28, 32, 28)
@@ -768,9 +1028,16 @@ class UpdatePage(QWidget):
 
         title = QLabel("Обновление")
         title.setObjectName("pageTitle")
+        root.addWidget(title)
+
+        # --- блок 1: zapret-discord-youtube --- #
+        zapret_heading = QLabel("Обновление zapret-discord-youtube")
+        zapret_heading.setObjectName("pageSubtitle")
+        zapret_heading.setStyleSheet("font-weight: 600; font-size: 15px;")
+        root.addWidget(zapret_heading)
+
         subtitle = QLabel(f"Источник: {GITHUB_RELEASES_PAGE}")
         subtitle.setObjectName("pageSubtitle")
-        root.addWidget(title)
         root.addWidget(subtitle)
 
         card = Card()
@@ -814,7 +1081,60 @@ class UpdatePage(QWidget):
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {TEXT_SECONDARY};")
         root.addWidget(note)
+
+        # --- блок 2: tg-ws-proxy (отдельная программа, отдельное обновление) --- #
+        tg_heading = QLabel("Обновление tg-ws-proxy")
+        tg_heading.setObjectName("pageSubtitle")
+        tg_heading.setStyleSheet("font-weight: 600; font-size: 15px;")
+        root.addWidget(tg_heading)
+
+        tg_subtitle = QLabel(f"Источник: {TG_GITHUB_RELEASES_PAGE}")
+        tg_subtitle.setObjectName("pageSubtitle")
+        root.addWidget(tg_subtitle)
+
+        tg_card = Card()
+        self.tg_installed_label = QLabel("Установленная версия: —")
+        self.tg_latest_label = QLabel("Последняя версия: —")
+        tg_card.body.addWidget(self.tg_installed_label)
+        tg_card.body.addWidget(self.tg_latest_label)
+
+        self.tg_progress_bar = QProgressBar()
+        self.tg_progress_bar.setRange(0, 100)
+        self.tg_progress_bar.setVisible(False)
+        tg_card.body.addWidget(self.tg_progress_bar)
+
+        self.tg_progress_label = QLabel("")
+        self.tg_progress_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        self.tg_progress_label.setVisible(False)
+        tg_card.body.addWidget(self.tg_progress_label)
+
+        tg_btn_row = QHBoxLayout()
+        self.tg_check_button = QPushButton("Проверить обновления")
+        self.tg_check_button.setObjectName("secondaryButton")
+        self.tg_check_button.clicked.connect(self.check_tg_updates)
+        self.tg_update_button = QPushButton("Скачать и установить одной кнопкой")
+        self.tg_update_button.setObjectName("primaryButton")
+        self.tg_update_button.clicked.connect(lambda: self.run_tg_update(None))
+        tg_btn_row.addWidget(self.tg_check_button)
+        tg_btn_row.addWidget(self.tg_update_button)
+        tg_btn_row.addStretch(1)
+        tg_card.body.addLayout(tg_btn_row)
+        root.addWidget(tg_card)
+
+        tg_note = QLabel(
+            "tg-ws-proxy - отдельная программа (локальный MTProto-прокси для "
+            "ускорения Telegram). Обновление затрагивает только сам exe-файл: "
+            "ваши настройки и секрет прокси не трогаются. Запуском, "
+            "остановкой и автозапуском tg-ws-proxy управляйте на вкладке "
+            "«Telegram»."
+        )
+        tg_note.setWordWrap(True)
+        tg_note.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        root.addWidget(tg_note)
+
         root.addStretch(1)
+
+        self._refresh_tg_labels()
 
     def check_updates(self) -> None:
         self.check_button.setEnabled(False)
@@ -956,6 +1276,83 @@ class UpdatePage(QWidget):
         self.progress_label.setText("Ошибка")
         self.main_window.set_busy(False)
         QMessageBox.warning(self, "Ошибка обновления", message)
+
+    # ------------------------------------------------------------------ #
+    # tg-ws-proxy
+    # ------------------------------------------------------------------ #
+    def _refresh_tg_labels(self) -> None:
+        state = load_state()
+        installed = state.tg_installed_version
+        if installed:
+            self.tg_installed_label.setText(f"Установленная версия: {installed}")
+        elif tg_manager.is_installed():
+            self.tg_installed_label.setText("Установленная версия: неизвестна")
+        else:
+            self.tg_installed_label.setText("Установленная версия: не установлена")
+
+    def check_tg_updates(self) -> None:
+        self.tg_check_button.setEnabled(False)
+        self.main_window.set_busy(True, "Проверяю обновления tg-ws-proxy...")
+        QTimer.singleShot(50, self._do_check_tg)
+
+    def _do_check_tg(self) -> None:
+        self.tg_check_button.setEnabled(True)
+        self.main_window.set_busy(False)
+        self._refresh_tg_labels()
+
+        try:
+            latest = tg_installer.fetch_latest_release()
+        except tg_installer.TgInstallerError as exc:
+            self.tg_latest_label.setText(f"Не удалось проверить: {exc}")
+            return
+
+        self.tg_latest_label.setText(f"Последняя версия: {latest.tag_name}")
+        installed = load_state().tg_installed_version
+        if installed != latest.tag_name:
+            self.tg_update_button.setText(f"Обновить до {latest.tag_name}")
+        else:
+            self.tg_update_button.setText("У вас последняя версия (переустановить)")
+
+    def run_tg_update(self, release) -> None:
+        self.tg_update_button.setEnabled(False)
+        self.tg_check_button.setEnabled(False)
+        self.tg_progress_bar.setVisible(True)
+        self.tg_progress_label.setVisible(True)
+        self.tg_progress_bar.setValue(0)
+        label = release.tag_name if release else "последнюю версию"
+        self.main_window.set_busy(True, f"Устанавливаю tg-ws-proxy {label}...")
+
+        self.tg_install_worker = TgInstallWorker(release)
+        self.tg_install_worker.progress.connect(self._on_tg_progress)
+        self.tg_install_worker.finished_ok.connect(self._on_tg_finished)
+        self.tg_install_worker.finished_error.connect(self._on_tg_error)
+        self.tg_install_worker.start()
+
+    def _on_tg_progress(self, msg: str, frac: float) -> None:
+        self.tg_progress_label.setText(msg)
+        self.tg_progress_bar.setValue(int(frac * 100))
+
+    def _on_tg_finished(self, release) -> None:
+        state = load_state()
+        state.tg_installed_version = release.tag_name
+        save_state(state)
+
+        self.tg_update_button.setEnabled(True)
+        self.tg_check_button.setEnabled(True)
+        self.tg_installed_label.setText(f"Установленная версия: {release.tag_name}")
+        self.tg_latest_label.setText(f"Последняя версия: {release.tag_name}")
+        self.tg_update_button.setText("У вас последняя версия (переустановить)")
+        self.main_window.set_busy(False)
+        if hasattr(self.main_window, "telegram_page"):
+            self.main_window.telegram_page.refresh()
+        QMessageBox.information(self, "Готово", f"tg-ws-proxy установлен, версия {release.tag_name}.")
+
+    def _on_tg_error(self, message: str) -> None:
+        self.tg_update_button.setEnabled(True)
+        self.tg_check_button.setEnabled(True)
+        self.tg_progress_label.setText("Ошибка")
+        self.main_window.set_busy(False)
+        QMessageBox.warning(self, "Ошибка обновления tg-ws-proxy", message)
 
 
 # --------------------------------------------------------------------------- #
@@ -1461,6 +1858,7 @@ class MainWindow(QMainWindow):
             ("home", "🏠", "Главная"),
             ("domains", "🌐", "Домены"),
             ("autotest", "🎯", "Автоподбор"),
+            ("telegram", "✈️", "Telegram"),
             ("update", "⬇️", "Обновление"),
             ("settings", "⚙️", "Настройки"),
         ]
@@ -1495,6 +1893,7 @@ class MainWindow(QMainWindow):
         self.home_page = HomePage(self)
         self.domains_page = DomainsPage(self)
         self.autotest_page = AutoTestPage(self)
+        self.telegram_page = TelegramPage(self)
         self.update_page = UpdatePage(self)
         self.settings_page = SettingsPage(self)
 
@@ -1502,6 +1901,7 @@ class MainWindow(QMainWindow):
             "home": self.home_page,
             "domains": self.domains_page,
             "autotest": self.autotest_page,
+            "telegram": self.telegram_page,
             "update": self.update_page,
             "settings": self.settings_page,
         }
@@ -1544,6 +1944,8 @@ class MainWindow(QMainWindow):
             self.autotest_page.start_test()
         if key == "domains":
             self.domains_page.reload()
+        if key == "telegram":
+            self.telegram_page.refresh()
 
     def set_busy(self, busy: bool, message: str = "") -> None:
         self.statusBar().showMessage(message if busy else "", 0)
@@ -1612,6 +2014,8 @@ class MainWindow(QMainWindow):
         running = process_manager.is_running() if process_manager.IS_WINDOWS else False
         current = load_state().last_strategy if running else None
         self.home_page.refresh(running, current)
+        if self.stack.currentWidget() is self.telegram_page:
+            self.telegram_page.refresh()
 
     # ------------------------------------------------------------------ #
     # ------------------------------------------------------------------ #
