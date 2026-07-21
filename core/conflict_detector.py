@@ -143,7 +143,14 @@ def _find_services() -> list[FoundService]:
         out = (result.stdout or "") + (result.stderr or "")
         if "does not exist" in out.lower():
             continue
-        found.append(FoundService(name=name, binary_path=_service_binary_path(name) or "?"))
+
+        binary_path = _service_binary_path(name) or "?"
+        if binary_path != "?":
+            exe = _parse_exe_from_image_path(binary_path)
+            if exe is not None and not _is_foreign(exe):
+                continue  # это наша собственная служба (поставлена самим ZapretDrum), не чужая
+
+        found.append(FoundService(name=name, binary_path=binary_path))
     return found
 
 
