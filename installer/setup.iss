@@ -52,96 +52,21 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 ; (нужно для управления winws.exe/WinDivert), а обычный CreateProcess не
 ; умеет запускать такие файлы напрямую - только через ShellExecute, отсюда
 ; и флаг. Без него после установки будет ошибка "CreateProcess: код 740".
-; skipifsilent - эта галочка "Launch ZapretDrum" нужна только при обычной,
-; интерактивной установке. Тихую самообновляющуюся установку (/VERYSILENT)
-; она тоже могла бы запустить, но без права на повторную попытку - если
-; в этот момент антивирус ещё сканирует свежеустановленный exe, запуск
-; падает с ошибкой вида "Failed to load Python DLL" и человеку приходится
-; открывать программу вручную. Поэтому для тихого запуска ниже есть
-; отдельная логика в CurStepChanged - с паузой и повторными попытками.
+; skipifsilent - галочка "Launch ZapretDrum" нужна только при обычной,
+; интерактивной установке. При тихой самообновляющейся установке
+; (/VERYSILENT) программу НЕ перезапускаем автоматически: раньше здесь
+; были попытки автоперезапуска с ретраями, но выяснилось, что если запуск
+; падает из-за антивируса/проверки репутации SmartScreen, каждая неудачная
+; попытка показывает своё собственное пугающее системное окно "Failed to
+; load Python DLL" (это делает сам бутлоадер PyInstaller изнутри упавшего
+; процесса - подавить это окно нельзя). Поэтому просто ничего не
+; перезапускаем: само приложение (core/app_updater.py + ui/main_window.py)
+; перед закрытием честно предупреждает пользователя, что после установки
+; нужно открыть ZapretDrum вручную - надёжнее, чем гадать, сработает ли
+; автозапуск.
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall shellexec skipifsilent
 
 [Code]
-// Перезапуск ZapretDrum после ТИХОЙ установки (самообновление из самого
-// приложения, core.app_updater.download_and_launch_update -> /VERYSILENT).
-// Проблема, которую это чинит: если запустить свежеустановленный exe
-// сразу же, антивирус (чаще всего встроенный Защитник Windows) иногда
-// ещё сканирует его в этот самый момент, и PyInstaller-бутлоадер не может
-// распаковать/загрузить свою DLL ("Failed to load Python DLL ... LoadLibrary:
-// не найден указанный модуль") - хотя сам файл на диске совершенно цел
-// (что и подтвердилось: повторный запуск вручную через минуту сработал).
-//
-// ВАЖНО: ShellExec возвращает True, как только Windows успешно СОЗДАЛА
-// процесс - а не когда он благополучно запустился. Ошибка загрузки DLL
-// происходит уже ВНУТРИ запущенного процесса, через доли секунды после
-// старта - то есть ShellExec к этому моменту уже вернёт True, и первая же
-// попытка "засчитывалась как успешная", хотя приложение тут же падало.
-// Поэтому одного ShellExec недостаточно: после запуска нужно подождать и
-// по-настоящему проверить через tasklist, жив ли процесс, а не полагаться
-// на результат самого ShellExec.
-function IsAppProcessRunning(): Boolean;
-var
-  ResultCode: Integer;
-  TmpFile, Content: String;
-  Lines: TStringList;
-begin
-  Result := False;
-  TmpFile := ExpandConstant('{tmp}\zapretdrum_tasklist.txt');
-  if Exec(ExpandConstant('{cmd}'),
-    '/C tasklist /NH /FI "IMAGENAME eq {#MyAppExeName}" > "' + TmpFile + '"',
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-  begin
-    if FileExists(TmpFile) then
-    begin
-      Lines := TStringList.Create;
-      try
-        Lines.LoadFromFile(TmpFile);
-        Content := Lowercase(Lines.Text);
-        Result := Pos(Lowercase('{#MyAppExeName}'), Content) > 0;
-      finally
-        Lines.Free;
-      end;
-      DeleteFile(TmpFile);
-    end;
-  end;
-end;
-
-procedure LaunchAfterSilentUpdate();
-var
-  ResultCode: Integer;
-  Attempt: Integer;
-begin
-  // ВАЖНО: если запуск падает из-за проверки репутации SmartScreen (а не
-  // просто быстрого антивирусного сканирования), задержка может быть
-  // непредсказуемо долгой - надёжно пересидеть её повторными попытками
-  // не получится. При этом КАЖДАЯ неудачная попытка показывает СВОЙ
-  // собственный системный попап "Failed to load Python DLL" (это делает
-  // сам бутлоадер PyInstaller изнутри упавшего процесса - подавить это
-  // окно со стороны инсталлятора нельзя). Поэтому больше 2 попыток не
-  // делаем: смысла долго перебирать нет, а лишние попытки только
-  // множат всплывающие окна с ошибкой на глазах у пользователя.
-  for Attempt := 1 to 2 do
-  begin
-    Sleep(3000 + (Attempt - 1) * 3000);  // 3с, затем 6с - даём больше времени с первого раза
-    ShellExec('open', ExpandConstant('{app}\{#MyAppExeName}'), '', '',
-      SW_SHOWNORMAL, ewNoWait, ResultCode);
-    Sleep(1500);
-    if IsAppProcessRunning() then
-      Break;
-  end;
-  // Если и это не помогло - молча сдаёмся: сама установка прошла успешно,
-  // файлы на месте, пользователь откроет ZapretDrum вручную через ярлык.
-  // Настоящее решение этой проблемы - цифровая подпись exe (уменьшает
-  // репутационные задержки SmartScreen) либо исключение папки установки
-  // в антивирусе на конкретной машине пользователя.
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
-begin
-  if (CurStep = ssDone) and WizardSilent() then
-    LaunchAfterSilentUpdate();
-end;
-
 // Полная деинсталляция: помимо файлов, которые ставил сам инсталлятор
 // (это Inno Setup делает автоматически), нужно ещё:
 //  1. остановить и удалить службу Windows "zapret" / "WinDivert", если она
