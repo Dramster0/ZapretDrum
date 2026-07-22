@@ -70,24 +70,61 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}
 // распаковать/загрузить свою DLL ("Failed to load Python DLL ... LoadLibrary:
 // не найден указанный модуль") - хотя сам файл на диске совершенно цел
 // (что и подтвердилось: повторный запуск вручную через минуту сработал).
-// Решение - не полагаться на единственную попытку сразу: подождать и,
-// если не получилось, попробовать ещё раз (с увеличивающейся паузой).
+//
+// ВАЖНО: ShellExec возвращает True, как только Windows успешно СОЗДАЛА
+// процесс - а не когда он благополучно запустился. Ошибка загрузки DLL
+// происходит уже ВНУТРИ запущенного процесса, через доли секунды после
+// старта - то есть ShellExec к этому моменту уже вернёт True, и первая же
+// попытка "засчитывалась как успешная", хотя приложение тут же падало.
+// Поэтому одного ShellExec недостаточно: после запуска нужно подождать и
+// по-настоящему проверить через tasklist, жив ли процесс, а не полагаться
+// на результат самого ShellExec.
+function IsAppProcessRunning(): Boolean;
+var
+  ResultCode: Integer;
+  TmpFile, Content: String;
+  Lines: TStringList;
+begin
+  Result := False;
+  TmpFile := ExpandConstant('{tmp}\zapretdrum_tasklist.txt');
+  if Exec(ExpandConstant('{cmd}'),
+    '/C tasklist /NH /FI "IMAGENAME eq {#MyAppExeName}" > "' + TmpFile + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    if FileExists(TmpFile) then
+    begin
+      Lines := TStringList.Create;
+      try
+        Lines.LoadFromFile(TmpFile);
+        Content := Lowercase(Lines.Text);
+        Result := Pos(Lowercase('{#MyAppExeName}'), Content) > 0;
+      finally
+        Lines.Free;
+      end;
+      DeleteFile(TmpFile);
+    end;
+  end;
+end;
+
 procedure LaunchAfterSilentUpdate();
 var
   ResultCode: Integer;
   Attempt: Integer;
-  Launched: Boolean;
 begin
-  Launched := False;
-  for Attempt := 1 to 4 do
+  for Attempt := 1 to 5 do
   begin
-    Sleep(1000 * Attempt);  // 1с, 2с, 3с, 4с - даём антивирусу "остыть"
-    if ShellExec('open', ExpandConstant('{app}\{#MyAppExeName}'), '', '',
-      SW_SHOWNORMAL, ewNoWait, ResultCode) then
-    begin
-      Launched := True;
+    // Нарастающая пауза ПЕРЕД запуском: 1с, 2.5с, 4с, 5.5с, 7с - даём
+    // антивирусу время закончить проверку файла.
+    Sleep(1000 + (Attempt - 1) * 1500);
+
+    ShellExec('open', ExpandConstant('{app}\{#MyAppExeName}'), '', '',
+      SW_SHOWNORMAL, ewNoWait, ResultCode);
+
+    // Даём приложению время либо благополучно стартовать, либо упасть -
+    // и ТОЛЬКО ПОТОМ проверяем, жив ли процесс на самом деле.
+    Sleep(1500);
+    if IsAppProcessRunning() then
       Break;
-    end;
   end;
   // Если все попытки не удались - молча сдаёмся: пользователь всё равно
   // увидит, что ZapretDrum не открылся, и запустит его сам через ярлык

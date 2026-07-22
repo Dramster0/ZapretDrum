@@ -119,10 +119,20 @@ def enable_autostart() -> None:
 
     script = _autostart_script_path()
     script.parent.mkdir(parents=True, exist_ok=True)
+    # On Error Resume Next + проверка FileExists - на случай, если к моменту
+    # следующего входа в Windows exe вдруг пропадёт (антивирус, ручное
+    # удаление, что угодно): без этого пользователь при каждом входе в
+    # систему видел бы пугающее окно "Windows Script Host: Системе не
+    # удаётся найти указанный путь" вместо тихого "просто не запустилось".
     content = (
-        'Set WshShell = CreateObject("WScript.Shell")\r\n'
-        f'WshShell.CurrentDirectory = "{TG_DIR}"\r\n'
-        f'WshShell.Run Chr(34) & "{TG_EXE_PATH}" & Chr(34) & " --portable", 0, False\r\n'
+        "On Error Resume Next\r\n"
+        f'Dim exePath : exePath = "{TG_EXE_PATH}"\r\n'
+        'Dim fso : Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+        "If fso.FileExists(exePath) Then\r\n"
+        '    Set WshShell = CreateObject("WScript.Shell")\r\n'
+        f'    WshShell.CurrentDirectory = "{TG_DIR}"\r\n'
+        '    WshShell.Run Chr(34) & exePath & Chr(34) & " --portable", 0, False\r\n'
+        "End If\r\n"
     )
     script.write_text(content, encoding="utf-8")
 

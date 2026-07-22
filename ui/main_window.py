@@ -1155,6 +1155,17 @@ class TelegramPage(QWidget):
         self.tg_update_card.setVisible(installed)
         self.danger_card.setVisible(installed)
 
+        # Статус автозапуска обновляем ВСЕГДА, даже если сам tg-ws-proxy
+        # сейчас не установлен - иначе осиротевший скрипт автозагрузки
+        # (например, если антивирус удалил exe, а запись в автозагрузке
+        # осталась) будет невозможно увидеть и выключить через интерфейс.
+        autostart_on = tg_manager.is_autostart_enabled()
+        self.autostart_status_label.setText(
+            "Автозапуск: включён" if autostart_on else "Автозапуск: выключен"
+        )
+        self.autostart_enable_btn.setEnabled(installed and not autostart_on)
+        self.autostart_disable_btn.setEnabled(autostart_on)
+
         if not installed:
             return
 
@@ -1167,13 +1178,6 @@ class TelegramPage(QWidget):
         self.status_label.setText("Запущен" if running else "Остановлен")
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
-
-        autostart_on = tg_manager.is_autostart_enabled()
-        self.autostart_status_label.setText(
-            "Автозапуск: включён" if autostart_on else "Автозапуск: выключен"
-        )
-        self.autostart_enable_btn.setEnabled(not autostart_on)
-        self.autostart_disable_btn.setEnabled(autostart_on)
 
     # ------------------------------------------------------------------ #
     def _on_install_clicked(self) -> None:
