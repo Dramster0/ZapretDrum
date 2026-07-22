@@ -21,6 +21,7 @@ tg-ws-proxy - это не консольная стратегия вроде win
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -130,3 +131,21 @@ def disable_autostart() -> None:
     script = _autostart_script_path()
     if script.exists():
         script.unlink()
+
+
+def delete_completely() -> None:
+    """
+    Полное удаление tg-ws-proxy: останавливает процесс (если запущен),
+    выключает автозапуск и стирает всю папку TG_DIR (сам exe и его
+    portable-данные - настройки, секрет прокси, логи). Само приложение
+    ZapretDrum при этом не трогается - можно будет установить tg-ws-proxy
+    заново с вкладки «Telegram».
+    """
+    _require_windows()
+
+    if is_running():
+        stop()
+    disable_autostart()
+
+    if TG_DIR.exists():
+        shutil.rmtree(TG_DIR, ignore_errors=True)

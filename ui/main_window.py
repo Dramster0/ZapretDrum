@@ -267,6 +267,82 @@ def _show_zapret_conflict_dialog(parent, report: "conflict_detector.ConflictRepo
     return result["choice"]
 
 
+def _show_tg_conflict_dialog(parent, report: "conflict_detector.TgConflictReport") -> str:
+    """То же самое, что _show_zapret_conflict_dialog, но для tg-ws-proxy -
+    у него нет служб Windows (это трей-приложение), поэтому список короче."""
+    dialog, layout = _make_frameless_dialog(parent, "Обнаружена другая установка tg-ws-proxy", 540, 400)
+
+    intro = QLabel(
+        "Похоже, на этом компьютере уже есть tg-ws-proxy, установленный "
+        "отдельно от ZapretDrum. Рекомендуем удалить найденное, чтобы не "
+        "запускались две независимые копии одновременно - ZapretDrum сам "
+        "скачает и будет управлять своей копией на вкладке «Telegram»."
+    )
+    intro.setWordWrap(True)
+    layout.addWidget(intro)
+
+    lines: list[str] = []
+    for proc in report.processes:
+        lines.append(f"Запущенный процесс: {proc.exe_path}  (PID {proc.pid})")
+    for folder in report.folders:
+        lines.append(f"Папка с файлами: {folder}")
+
+    found_view = QTextEdit()
+    found_view.setObjectName("logView")
+    found_view.setReadOnly(True)
+    found_view.setPlainText("\n".join(lines))
+    found_view.setFixedHeight(130)
+    layout.addWidget(found_view)
+
+    layout.addStretch(1)
+
+    btn_row = QHBoxLayout()
+    delete_btn = QPushButton("Удалить всё и продолжить")
+    delete_btn.setObjectName("dangerButton")
+    skip_btn = QPushButton("Не спрашивать больше")
+    skip_btn.setObjectName("secondaryButton")
+    later_btn = QPushButton("Напомнить в следующий раз")
+    later_btn.setObjectName("secondaryButton")
+    btn_row.addWidget(delete_btn)
+    btn_row.addWidget(skip_btn)
+    btn_row.addWidget(later_btn)
+    layout.addLayout(btn_row)
+
+    result = {"choice": "later"}
+
+    def do_delete() -> None:
+        if not _confirm(
+            dialog,
+            "Подтверждение удаления",
+            "Найденный процесс и папки будут остановлены и удалены безвозвратно. Продолжить?",
+            ok_text="Удалить",
+            danger=True,
+        ):
+            return
+        delete_btn.setEnabled(False)
+        skip_btn.setEnabled(False)
+        later_btn.setEnabled(False)
+        log = conflict_detector.resolve_tg(report, delete_folders=True)
+        result["choice"] = "deleted"
+        dialog.accept()
+        _show_log_dialog(parent, "Результат очистки", "\n".join(log) or "Нечего было удалять.")
+
+    def do_skip() -> None:
+        result["choice"] = "skipped"
+        dialog.accept()
+
+    def do_later() -> None:
+        result["choice"] = "later"
+        dialog.accept()
+
+    delete_btn.clicked.connect(do_delete)
+    skip_btn.clicked.connect(do_skip)
+    later_btn.clicked.connect(do_later)
+
+    dialog.exec()
+    return result["choice"]
+
+
 def _confirm(
     parent, title: str, text: str,
     ok_text: str = "Продолжить", cancel_text: str = "Отмена", danger: bool = False,
@@ -964,6 +1040,43 @@ class TelegramPage(QWidget):
         self.status_card.body.addLayout(control_row)
         root.addWidget(self.status_card)
 
+        # --- карточка обновления (проверить/скачать новую версию, не уходя
+        # с вкладки - то же самое, что и блок на странице «Обновление») --- #
+        self.tg_update_card = Card()
+        update_title = QLabel("Обновление tg-ws-proxy")
+        update_title.setStyleSheet("font-weight: 600;")
+        self.tg_update_card.body.addWidget(update_title)
+
+        self.tg_latest_label = QLabel("Последняя версия: —")
+        self.tg_latest_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        self.tg_update_card.body.addWidget(self.tg_latest_label)
+
+        self.tg_update_progress_bar = QProgressBar()
+        self.tg_update_progress_bar.setRange(0, 100)
+        self.tg_update_progress_bar.setVisible(False)
+        self.tg_update_card.body.addWidget(self.tg_update_progress_bar)
+
+        self.tg_update_progress_label = QLabel("")
+        self.tg_update_progress_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        self.tg_update_progress_label.setVisible(False)
+        self.tg_update_card.body.addWidget(self.tg_update_progress_label)
+
+        tg_update_btn_row = QHBoxLayout()
+        self.tg_check_update_btn = QPushButton("Проверить обновления")
+        self.tg_check_update_btn.setObjectName("secondaryButton")
+        self.tg_check_update_btn.clicked.connect(self._on_check_update_clicked)
+        self.tg_do_update_btn = QPushButton("Скачать и установить")
+        self.tg_do_update_btn.setObjectName("primaryButton")
+        self.tg_do_update_btn.setEnabled(False)
+        self.tg_do_update_btn.clicked.connect(self._on_do_update_clicked)
+        tg_update_btn_row.addWidget(self.tg_check_update_btn)
+        tg_update_btn_row.addWidget(self.tg_do_update_btn)
+        tg_update_btn_row.addStretch(1)
+        self.tg_update_card.body.addLayout(tg_update_btn_row)
+        root.addWidget(self.tg_update_card)
+
+        self._pending_tg_release = None
+
         # --- карточка автозапуска --- #
         autostart_card = Card()
         autostart_title = QLabel("Автозапуск")
@@ -996,6 +1109,22 @@ class TelegramPage(QWidget):
         autostart_card.body.addLayout(autostart_row)
         root.addWidget(autostart_card)
 
+        # --- опасная зона: полное удаление --- #
+        self.danger_card = Card()
+        danger_title = QLabel("Опасная зона")
+        danger_title.setStyleSheet("font-weight: 600;")
+        self.danger_card.body.addWidget(danger_title)
+        delete_completely_btn = QPushButton("🗑  Удалить tg-ws-proxy полностью")
+        delete_completely_btn.setObjectName("dangerButton")
+        delete_completely_btn.setToolTip(
+            "Останавливает tg-ws-proxy, выключает автозапуск и удаляет весь скачанный "
+            "exe и его настройки. Само приложение ZapretDrum остаётся - можно будет "
+            "установить tg-ws-proxy заново."
+        )
+        delete_completely_btn.clicked.connect(self._on_delete_completely)
+        self.danger_card.body.addWidget(delete_completely_btn)
+        root.addWidget(self.danger_card)
+
         # --- вспомогательные ссылки --- #
         links_row = QHBoxLayout()
         open_folder_btn = QPushButton("Открыть папку данных")
@@ -1023,6 +1152,8 @@ class TelegramPage(QWidget):
         installed = tg_manager.is_installed()
         self.install_card.setVisible(not installed)
         self.status_card.setVisible(installed)
+        self.tg_update_card.setVisible(installed)
+        self.danger_card.setVisible(installed)
 
         if not installed:
             return
@@ -1120,6 +1251,94 @@ class TelegramPage(QWidget):
     def _on_disable_autostart(self) -> None:
         tg_manager.disable_autostart()
         self.refresh()
+
+    # ------------------------------------------------------------------ #
+    def _on_check_update_clicked(self) -> None:
+        self.tg_check_update_btn.setEnabled(False)
+        self.tg_latest_label.setText("Проверяю...")
+        self.main_window.set_busy(True, "Проверяю обновления tg-ws-proxy...")
+        QTimer.singleShot(50, self._do_check_update)
+
+    def _do_check_update(self) -> None:
+        self.tg_check_update_btn.setEnabled(True)
+        self.main_window.set_busy(False)
+        try:
+            latest = tg_installer.fetch_latest_release()
+        except tg_installer.TgInstallerError as exc:
+            self.tg_latest_label.setText(f"Не удалось проверить: {exc}")
+            return
+
+        self._pending_tg_release = latest
+        installed = load_state().tg_installed_version
+        if installed != latest.tag_name:
+            self.tg_latest_label.setText(f"Доступна новая версия: {latest.tag_name}")
+            self.tg_do_update_btn.setEnabled(True)
+            self.tg_do_update_btn.setText(f"Обновить до {latest.tag_name}")
+        else:
+            self.tg_latest_label.setText(f"У вас последняя версия: {latest.tag_name}")
+            self.tg_do_update_btn.setEnabled(False)
+            self.tg_do_update_btn.setText("Скачать и установить")
+
+    def _on_do_update_clicked(self) -> None:
+        self.tg_do_update_btn.setEnabled(False)
+        self.tg_check_update_btn.setEnabled(False)
+        self.tg_update_progress_bar.setVisible(True)
+        self.tg_update_progress_label.setVisible(True)
+        self.tg_update_progress_bar.setValue(0)
+        self.main_window.set_busy(True, "Обновляю tg-ws-proxy...")
+
+        self.install_worker = TgInstallWorker(self._pending_tg_release)
+        self.install_worker.progress.connect(self._on_update_progress)
+        self.install_worker.finished_ok.connect(self._on_update_finished)
+        self.install_worker.finished_error.connect(self._on_update_error)
+        self.install_worker.start()
+
+    def _on_update_progress(self, msg: str, frac: float) -> None:
+        self.tg_update_progress_label.setText(msg)
+        self.tg_update_progress_bar.setValue(int(frac * 100))
+
+    def _on_update_finished(self, release) -> None:
+        state = load_state()
+        state.tg_installed_version = release.tag_name
+        save_state(state)
+
+        self.tg_check_update_btn.setEnabled(True)
+        self.tg_do_update_btn.setEnabled(False)
+        self.tg_do_update_btn.setText("Скачать и установить")
+        self.tg_latest_label.setText(f"У вас последняя версия: {release.tag_name}")
+        self.main_window.set_busy(False)
+        self.refresh()
+        QMessageBox.information(self, "Готово", f"tg-ws-proxy обновлён до {release.tag_name}.")
+
+    def _on_update_error(self, message: str) -> None:
+        self.tg_check_update_btn.setEnabled(True)
+        self.tg_do_update_btn.setEnabled(True)
+        self.main_window.set_busy(False)
+        QMessageBox.warning(self, "Ошибка обновления", message)
+
+    # ------------------------------------------------------------------ #
+    def _on_delete_completely(self) -> None:
+        if not _confirm(
+            self,
+            "Удалить tg-ws-proxy полностью?",
+            "Программа будет остановлена, автозапуск выключен, скачанный exe и все "
+            "его настройки (включая секрет прокси) - удалены безвозвратно. "
+            "Продолжить?",
+            ok_text="Удалить",
+            danger=True,
+        ):
+            return
+        try:
+            tg_manager.delete_completely()
+        except tg_manager.TgManagerError as exc:
+            QMessageBox.warning(self, "Ошибка", str(exc))
+            return
+
+        state = load_state()
+        state.tg_installed_version = None
+        save_state(state)
+        self.refresh()
+        QMessageBox.information(self, "Готово", "tg-ws-proxy полностью удалён.")
 
 
 class UpdatePage(QWidget):
@@ -2091,20 +2310,44 @@ class MainWindow(QMainWindow):
         zapret-discord-youtube, установленного отдельно от ZapretDrum, и
         предлагает его удалить, чтобы не было конфликтов служб/процессов.
         """
+        try:
+            if not process_manager.IS_WINDOWS:
+                return
+            state = load_state()
+            if state.zapret_conflict_dismissed:
+                return
+
+            report = conflict_detector.detect()
+            if report.is_empty():
+                return
+
+            choice = _show_zapret_conflict_dialog(self, report)
+            if choice in ("deleted", "skipped"):
+                state = load_state()
+                state.zapret_conflict_dismissed = True
+                save_state(state)
+        finally:
+            # Проверку tg-ws-proxy запускаем ПОСЛЕ этой (а не одновременно
+            # через второй таймер) - иначе оба диалога могут открыться
+            # один поверх другого, если первый ещё не закрыт.
+            QTimer.singleShot(300, self._check_tg_conflicts)
+
+    def _check_tg_conflicts(self) -> None:
+        """То же самое, что _check_zapret_conflicts, но для tg-ws-proxy."""
         if not process_manager.IS_WINDOWS:
             return
         state = load_state()
-        if state.zapret_conflict_dismissed:
+        if state.tg_conflict_dismissed:
             return
 
-        report = conflict_detector.detect()
+        report = conflict_detector.detect_tg()
         if report.is_empty():
             return
 
-        choice = _show_zapret_conflict_dialog(self, report)
+        choice = _show_tg_conflict_dialog(self, report)
         if choice in ("deleted", "skipped"):
             state = load_state()
-            state.zapret_conflict_dismissed = True
+            state.tg_conflict_dismissed = True
             save_state(state)
 
     # ------------------------------------------------------------------ #

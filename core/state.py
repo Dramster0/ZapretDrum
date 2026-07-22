@@ -25,6 +25,7 @@ class AppState:
     autostart_enabled: bool = False
     tg_installed_version: Optional[str] = None
     zapret_conflict_dismissed: bool = False
+    tg_conflict_dismissed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
