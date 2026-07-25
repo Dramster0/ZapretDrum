@@ -59,12 +59,14 @@ TG_GITHUB_RELEASES_PAGE = (
 # называется на диске, и его легко искать по имени в psutil.
 TG_EXE_NAME = "TgWsProxy_windows.exe"
 
-# Скрипт автозагрузки кладём в личную папку автозагрузки пользователя
+# Ярлык автозагрузки кладём в личную папку автозагрузки пользователя
 # (не в общесистемную) - для неё не нужны права администратора, в отличие
 # от службы Windows, которая тут в принципе не подходит: tg-ws-proxy -
 # трей-приложение с собственным окном/иконкой, а служба Windows не имеет
 # доступа к рабочему столу пользователя и не сможет показать трей.
-TG_AUTOSTART_SCRIPT_NAME = "ZapretDrum-TgWsProxy.vbs"
+# Обычный .lnk-ярлык (а не скрипт) - чтобы не попадать под правило защиты
+# Windows Attack Surface Reduction, блокирующее запуск exe из VBScript.
+TG_AUTOSTART_SHORTCUT_NAME = "ZapretDrum-TgWsProxy.lnk"
 
 
 def _app_data_root() -> Path:

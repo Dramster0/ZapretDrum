@@ -14,10 +14,22 @@ tg-ws-proxy - это не консольная стратегия вроде win
     способ, которым в системную автозагрузку добавляют себя большинство
     обычных трей-программ (мессенджеры, лаунчеры и т.п.).
 
-Автозапуск оформлен через маленький .vbs-скрипт, а не .lnk-ярлык: так не
-нужна дополнительная библиотека (pywin32/winshell) только ради создания
-ярлыка, а WScript.Shell.Run с последним параметром False запускает процесс
-полностью скрыто, без мелькания окна консоли.
+В автозагрузке лежит обычный ярлык (.lnk), а НЕ скрипт. Раньше здесь был
+.vbs-скрипт, который сам вызывал WshShell.Run на exe при каждом входе в
+систему - и выяснилось, что это в точности тот паттерн, который правило
+защиты Windows Attack Surface Reduction "Блокировать запуск исполняемого
+содержимого из VBScript/JavaScript" блокирует по умолчанию во многих
+конфигурациях - часто без всякого видимого предупреждения (просто "ничего
+не происходит"). Обычный .lnk-ярлык под это правило не подпадает - это
+ровно то, как оформляют автозапуск подавляющее большинство обычных
+трей-программ, и Windows такому запуску доверяет.
+
+Сам .lnk создаётся через одноразовый VBS-помощник (запускается один раз, в
+момент нажатия "Включить автозапуск", и сразу удаляется) - он не запускает
+tg-ws-proxy, а только вызывает штатный метод WScript.Shell.CreateShortcut,
+поэтому под то же самое правило ASR не попадает (там нет запуска exe).
+Это позволяет обойтись без дополнительной библиотеки (pywin32/winshell)
+для работы с .lnk-файлами.
 """
 from __future__ import annotations
 
@@ -28,7 +40,7 @@ from pathlib import Path
 
 import psutil
 
-from core.paths import TG_DIR, TG_EXE_PATH, TG_EXE_NAME, TG_AUTOSTART_SCRIPT_NAME, windows_startup_folder
+from core.paths import TG_DIR, TG_EXE_PATH, TG_EXE_NAME, TG_AUTOSTART_SHORTCUT_NAME, windows_startup_folder
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -104,12 +116,18 @@ def stop(timeout: float = 5.0) -> None:
             pass
 
 
-def _autostart_script_path() -> Path:
-    return windows_startup_folder() / TG_AUTOSTART_SCRIPT_NAME
+def _autostart_shortcut_path() -> Path:
+    return windows_startup_folder() / TG_AUTOSTART_SHORTCUT_NAME
+
+
+def _legacy_autostart_script_path() -> Path:
+    """Путь старого .vbs-варианта автозапуска (версии до фикса ASR) - чтобы
+    можно было подчистить его при переходе на .lnk-ярлык."""
+    return windows_startup_folder() / "ZapretDrum-TgWsProxy.vbs"
 
 
 def is_autostart_enabled() -> bool:
-    return _autostart_script_path().exists()
+    return _autostart_shortcut_path().exists()
 
 
 def enable_autostart() -> None:
@@ -117,30 +135,51 @@ def enable_autostart() -> None:
     if not TG_EXE_PATH.exists():
         raise TgManagerError("Сначала установите tg-ws-proxy на странице «Обновление».")
 
-    script = _autostart_script_path()
-    script.parent.mkdir(parents=True, exist_ok=True)
-    # On Error Resume Next + проверка FileExists - на случай, если к моменту
-    # следующего входа в Windows exe вдруг пропадёт (антивирус, ручное
-    # удаление, что угодно): без этого пользователь при каждом входе в
-    # систему видел бы пугающее окно "Windows Script Host: Системе не
-    # удаётся найти указанный путь" вместо тихого "просто не запустилось".
-    content = (
-        "On Error Resume Next\r\n"
-        f'Dim exePath : exePath = "{TG_EXE_PATH}"\r\n'
-        'Dim fso : Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
-        "If fso.FileExists(exePath) Then\r\n"
-        '    Set WshShell = CreateObject("WScript.Shell")\r\n'
-        f'    WshShell.CurrentDirectory = "{TG_DIR}"\r\n'
-        '    WshShell.Run Chr(34) & exePath & Chr(34) & " --portable", 0, False\r\n'
-        "End If\r\n"
+    # На случай, если остался старый .vbs-скрипт от прошлой версии -
+    # убираем его, чтобы не осталось двух конфликтующих записей автозапуска.
+    legacy = _legacy_autostart_script_path()
+    if legacy.exists():
+        legacy.unlink()
+
+    shortcut_path = _autostart_shortcut_path()
+    shortcut_path.parent.mkdir(parents=True, exist_ok=True)
+
+    helper_script = TG_DIR / "_create_shortcut_helper.vbs"
+    helper_content = (
+        'Set WshShell = CreateObject("WScript.Shell")\r\n'
+        f'Set Shortcut = WshShell.CreateShortcut("{shortcut_path}")\r\n'
+        f'Shortcut.TargetPath = "{TG_EXE_PATH}"\r\n'
+        'Shortcut.Arguments = "--portable"\r\n'
+        f'Shortcut.WorkingDirectory = "{TG_DIR}"\r\n'
+        "Shortcut.WindowStyle = 7\r\n"
+        "Shortcut.Save\r\n"
     )
-    script.write_text(content, encoding="utf-8")
+    helper_script.write_text(helper_content, encoding="utf-8")
+    try:
+        subprocess.run(
+            ["wscript.exe", str(helper_script)],
+            timeout=10,
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
+        )
+    finally:
+        helper_script.unlink(missing_ok=True)
+
+    if not shortcut_path.exists():
+        raise TgManagerError(
+            "Не удалось создать ярлык автозагрузки. Попробуйте добавить папку "
+            "tg-ws-proxy в исключения антивируса и повторить."
+        )
 
 
 def disable_autostart() -> None:
-    script = _autostart_script_path()
-    if script.exists():
-        script.unlink()
+    shortcut_path = _autostart_shortcut_path()
+    if shortcut_path.exists():
+        shortcut_path.unlink()
+
+    legacy = _legacy_autostart_script_path()
+    if legacy.exists():
+        legacy.unlink()
 
 
 def delete_completely() -> None:
