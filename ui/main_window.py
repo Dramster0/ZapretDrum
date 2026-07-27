@@ -1152,8 +1152,14 @@ class TelegramPage(QWidget):
         # Автоматически заменяем старый .vbs-автозапуск (если остался с
         # версии до фикса ASR) на новый .lnk - без участия пользователя,
         # каждый раз при открытии вкладки. Безопасно вызывать многократно.
+        # Обёрнуто в try/except как последний рубеж защиты: это выполняется
+        # само, без действий пользователя, и не должно суметь уронить
+        # интерфейс ни при каких обстоятельствах.
         if tg_manager.IS_WINDOWS:
-            tg_manager.migrate_legacy_autostart()
+            try:
+                tg_manager.migrate_legacy_autostart()
+            except Exception:  # noqa: BLE001
+                pass
 
         installed = tg_manager.is_installed()
         self.install_card.setVisible(not installed)

@@ -143,6 +143,12 @@ def _create_shortcut() -> None:
 
     helper_script = TG_DIR / "_create_shortcut_helper.vbs"
     helper_content = (
+        # On Error Resume Next - если Shortcut.Save вдруг не удастся (мало
+        # ли по какой причине), скрипт просто тихо завершится, а не
+        # покажет своё модальное окно ошибки, которое зависло бы и не
+        # дало wscript.exe завершиться - именно это и привело к таймауту
+        # и краху приложения ниже.
+        "On Error Resume Next\r\n"
         'Set WshShell = CreateObject("WScript.Shell")\r\n'
         f'Set Shortcut = WshShell.CreateShortcut("{shortcut_path}")\r\n'
         f'Shortcut.TargetPath = "{TG_EXE_PATH}"\r\n'
@@ -151,14 +157,30 @@ def _create_shortcut() -> None:
         "Shortcut.WindowStyle = 7\r\n"
         "Shortcut.Save\r\n"
     )
-    helper_script.write_text(helper_content, encoding="utf-8")
+    # ВАЖНО: Windows Script Host не распознаёт обычный UTF-8 (без BOM) как
+    # Unicode - он читает файл как будто он в системной ANSI-кодировке
+    # (например, CP1251 на русской Windows), из-за чего любые кириллические
+    # символы в пути (например, "C:\Users\Руслан\...") превращаются в
+    # нечитаемую кашу, и путь перестаёт существовать. WSH корректно
+    # распознаёт Unicode-скрипты только по BOM UTF-16LE - поэтому пишем
+    # именно так, а не как обычный текстовый файл.
+    helper_script.write_text(helper_content, encoding="utf-16")
     try:
+        # Даже если wscript.exe всё-таки зависнет (например, из-за старой
+        # версии скрипта без On Error Resume Next, или по любой другой
+        # причине) - ловим TimeoutExpired и любые другие ошибки запуска
+        # сами, чтобы это никогда не роняло всё приложение необработанным
+        # исключением, как это произошло раньше.
         subprocess.run(
             ["wscript.exe", str(helper_script)],
             timeout=10,
             capture_output=True,
             creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
         )
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError:
+        pass
     finally:
         helper_script.unlink(missing_ok=True)
 
@@ -190,8 +212,13 @@ def migrate_legacy_autostart() -> None:
     if TG_EXE_PATH.exists():
         try:
             _create_shortcut()
-        except TgManagerError:
-            pass  # не критично - пользователь всё равно увидит актуальный статус и сможет включить вручную
+        except Exception:  # noqa: BLE001
+            # Эта функция запускается сама, без участия пользователя, при
+            # каждом открытии вкладки - она не должна суметь уронить
+            # приложение вообще ни при каких обстоятельствах. Если не
+            # получилось - пользователь всё равно увидит актуальный
+            # статус на вкладке и сможет включить автозапуск вручную.
+            pass
 
 
 def enable_autostart() -> None:
