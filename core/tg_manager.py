@@ -127,20 +127,17 @@ def _legacy_autostart_script_path() -> Path:
 
 
 def is_autostart_enabled() -> bool:
-    return _autostart_shortcut_path().exists()
+    # Важно: проверяем ОБА варианта. Если бы тут смотрели только на новый
+    # .lnk, приложение считало бы автозапуск выключенным, даже если на
+    # самом деле в автозагрузке всё ещё лежит старый (нерабочий) .vbs -
+    # из-за этого кнопка "Выключить автозапуск" становилась бы неактивной,
+    # и убрать битый старый файл через интерфейс было бы невозможно.
+    return _autostart_shortcut_path().exists() or _legacy_autostart_script_path().exists()
 
 
-def enable_autostart() -> None:
-    _require_windows()
-    if not TG_EXE_PATH.exists():
-        raise TgManagerError("Сначала установите tg-ws-proxy на странице «Обновление».")
-
-    # На случай, если остался старый .vbs-скрипт от прошлой версии -
-    # убираем его, чтобы не осталось двух конфликтующих записей автозапуска.
-    legacy = _legacy_autostart_script_path()
-    if legacy.exists():
-        legacy.unlink()
-
+def _create_shortcut() -> None:
+    """Общая часть создания .lnk - используется и enable_autostart(), и
+    автоматической миграцией со старого .vbs."""
     shortcut_path = _autostart_shortcut_path()
     shortcut_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -170,6 +167,45 @@ def enable_autostart() -> None:
             "Не удалось создать ярлык автозагрузки. Попробуйте добавить папку "
             "tg-ws-proxy в исключения антивируса и повторить."
         )
+
+
+def migrate_legacy_autostart() -> None:
+    """
+    Автоматически заменяет старый .vbs-автозапуск (версии до фикса ASR) на
+    новый .lnk-ярлык - без участия пользователя. Вызывается при каждом
+    открытии вкладки «Telegram», ничего не делает, если старого файла нет
+    (безопасно вызывать многократно). Это чинит ситуацию, когда у
+    пользователя автозапуск уже был включён ДО обновления: раньше ему
+    пришлось бы самому сообразить нажать "Выключить" и "Включить" заново,
+    хотя интерфейс из-за старого бага даже не показывал, что автозапуск
+    вообще на что-то включён.
+    """
+    if not IS_WINDOWS:
+        return
+    legacy = _legacy_autostart_script_path()
+    if not legacy.exists():
+        return
+
+    legacy.unlink()
+    if TG_EXE_PATH.exists():
+        try:
+            _create_shortcut()
+        except TgManagerError:
+            pass  # не критично - пользователь всё равно увидит актуальный статус и сможет включить вручную
+
+
+def enable_autostart() -> None:
+    _require_windows()
+    if not TG_EXE_PATH.exists():
+        raise TgManagerError("Сначала установите tg-ws-proxy на странице «Обновление».")
+
+    # На случай, если остался старый .vbs-скрипт от прошлой версии -
+    # убираем его, чтобы не осталось двух конфликтующих записей автозапуска.
+    legacy = _legacy_autostart_script_path()
+    if legacy.exists():
+        legacy.unlink()
+
+    _create_shortcut()
 
 
 def disable_autostart() -> None:

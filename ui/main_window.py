@@ -1149,6 +1149,12 @@ class TelegramPage(QWidget):
 
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:
+        # Автоматически заменяем старый .vbs-автозапуск (если остался с
+        # версии до фикса ASR) на новый .lnk - без участия пользователя,
+        # каждый раз при открытии вкладки. Безопасно вызывать многократно.
+        if tg_manager.IS_WINDOWS:
+            tg_manager.migrate_legacy_autostart()
+
         installed = tg_manager.is_installed()
         self.install_card.setVisible(not installed)
         self.status_card.setVisible(installed)
