@@ -19,6 +19,7 @@ from typing import Callable, Optional
 
 import requests
 
+from core import process_manager
 from core.paths import (
     ZAPRET_DIR,
     DOWNLOAD_TMP_DIR,
@@ -194,9 +195,29 @@ def install_or_update(progress_cb: ProgressCB = None, release: ReleaseInfo | Non
 
     src_root = _find_extracted_root(extract_dir)
 
+    # ВАЖНО: если winws.exe в этот момент запущен (через "Главную" или как
+    # служба), Windows держит файлы в ZAPRET_DIR заблокированными, и
+    # удаление ниже либо частично провалится, либо не удалит сам exe.
+    # Раньше это не проверялось, а ошибка удаления тихо игнорировалась
+    # (ignore_errors=True) - из-за этого новая версия оказывалась не
+    # заменой старой, а ВЛОЖЕННОЙ ВНУТРЬ неудалённой старой папки (новая
+    # подпапка с номером версии рядом со старыми bin/lists), и
+    # is_installed() переставал находить winws.exe в ожидаемом месте.
+    if process_manager.IS_WINDOWS and process_manager.is_running():
+        _report(progress_cb, "Останавливаю zapret перед обновлением...", 0.82)
+        process_manager.stop_all()
+
     _report(progress_cb, "Устанавливаю новую версию...", 0.9)
     if ZAPRET_DIR.exists():
-        shutil.rmtree(ZAPRET_DIR, ignore_errors=True)
+        try:
+            shutil.rmtree(ZAPRET_DIR)
+        except OSError as exc:
+            raise InstallerError(
+                "Не удалось удалить предыдущую версию zapret - вероятно, winws.exe "
+                "всё ещё запущен или его файлы заблокированы антивирусом. Закройте "
+                "zapret (кнопка «Отключить» на Главной) и попробуйте ещё раз. "
+                f"Подробности: {exc}"
+            ) from exc
     shutil.move(str(src_root), str(ZAPRET_DIR))
 
     _restore_user_lists()
