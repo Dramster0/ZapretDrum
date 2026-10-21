@@ -1903,11 +1903,11 @@ class SettingsPage(QWidget):
             "Текущая установка будет удалена и скачана заново. Продолжить?",
         )
         if confirm:
-            import shutil
+            from core import installer
 
-            if process_manager.IS_WINDOWS and process_manager.is_running():
-                process_manager.stop_all()
-            shutil.rmtree(ZAPRET_DIR, ignore_errors=True)
+            # Установка теперь устойчива к остаткам, так что даже если часть
+            # файлов занята драйвером - новая версия встанет корректно.
+            installer.remove_install()
             self.main_window.go_to("update")
 
     def _check_conflicts_manually(self) -> None:
@@ -1949,11 +1949,21 @@ class SettingsPage(QWidget):
             self._finish_delete_zapret()
 
     def _finish_delete_zapret(self) -> None:
-        import shutil
+        from core import installer
 
         self.main_window.set_busy(False)
-        shutil.rmtree(ZAPRET_DIR, ignore_errors=True)
-        QMessageBox.information(self, "Готово", "zapret удалён.")
+        leftovers = installer.remove_install()
+        if leftovers:
+            QMessageBox.warning(
+                self,
+                "Удалено не полностью",
+                "Часть файлов удалить не удалось - скорее всего, их держит драйвер "
+                "WinDivert или антивирус. Они удалятся после перезагрузки компьютера "
+                "(либо перезапишутся при следующей установке zapret).\n\n"
+                + "\n".join(leftovers[:5]),
+            )
+        else:
+            QMessageBox.information(self, "Готово", "zapret удалён.")
         self.main_window.notify_installed()
         self.main_window.go_to("home")
 

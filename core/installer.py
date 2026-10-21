@@ -12,6 +12,9 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
+import sys
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,8 +111,145 @@ def fetch_all_releases(limit: int = 30) -> list[ReleaseInfo]:
     return releases
 
 
+IS_WINDOWS = sys.platform == "win32"
+
+# Службы, которые держат файлы zapret заблокированными: сама служба zapret
+# и драйвер WinDivert (WinDivert64.sys остаётся загруженным в ядре даже
+# после остановки winws.exe - из-за этого папку bin нельзя удалить целиком,
+# пока драйвер не выгружен).
+_LOCKING_SERVICES = ("zapret", "WinDivert", "WinDivert14")
+
+
+def _winws_path() -> Path:
+    return ZAPRET_DIR / "bin" / "winws.exe"
+
+
 def is_installed() -> bool:
-    return (ZAPRET_DIR / "bin" / "winws.exe").exists()
+    if _winws_path().exists():
+        return True
+    # Самовосстановление: если из-за прошлых сбоев новая версия оказалась
+    # вложена в подпапку (ZAPRET_DIR/zapret-discord-youtube-x.y.z/...),
+    # вытаскиваем её содержимое на нужный уровень.
+    return repair_install_layout()
+
+
+def release_locks() -> None:
+    """
+    Освобождает файлы zapret перед заменой/удалением: останавливает
+    winws.exe, службу zapret и драйвер WinDivert. Ошибки игнорируются -
+    это best-effort, дальше установка всё равно устойчива к остаткам.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        if process_manager.is_running():
+            process_manager.stop_all()
+    except Exception:  # noqa: BLE001
+        pass
+    for name in _LOCKING_SERVICES:
+        try:
+            subprocess.run(
+                ["sc", "stop", name],
+                capture_output=True,
+                timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    time.sleep(1.0)  # даём драйверу время выгрузиться
+
+
+def _remove_path(p: Path) -> bool:
+    try:
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            p.unlink()
+    except OSError:
+        pass
+    return not p.exists()
+
+
+def _clear_dir_contents(directory: Path) -> list[str]:
+    """Удаляет всё содержимое папки (саму папку не трогаем). Возвращает
+    список того, что удалить не удалось (занято драйвером/антивирусом/Проводником)."""
+    leftovers: list[str] = []
+    if not directory.is_dir():
+        return leftovers
+    for child in list(directory.iterdir()):
+        if not _remove_path(child):
+            leftovers.append(str(child))
+    return leftovers
+
+
+def _merge_move(src: Path, dst: Path, failures: list[str]) -> None:
+    """
+    Переносит СОДЕРЖИМОЕ src внутрь dst, перезаписывая совпадающие файлы и
+    сливая папки. В отличие от shutil.move(src, dst) НИКОГДА не создаёт
+    вложенную папку, даже если dst уже существует.
+    """
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in list(src.iterdir()):
+        target = dst / item.name
+        if item.is_dir() and not item.is_symlink():
+            if target.exists() and not target.is_dir():
+                if not _remove_path(target):
+                    failures.append(str(target))
+                    continue
+            _merge_move(item, target, failures)
+        else:
+            try:
+                if target.exists():
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                shutil.move(str(item), str(target))
+            except OSError:
+                failures.append(str(target))
+    try:
+        src.rmdir()
+    except OSError:
+        pass
+
+
+def repair_install_layout() -> bool:
+    """
+    Чинит раскладку, в которой настоящая установка оказалась вложена в
+    подпапку внутри ZAPRET_DIR (а в самой ZAPRET_DIR лежат только остатки
+    вроде пустого bin/ и lists/). Возвращает True, если после ремонта
+    winws.exe на месте. Безопасно вызывать многократно.
+    """
+    if _winws_path().exists() or not ZAPRET_DIR.is_dir():
+        return False
+    try:
+        for child in list(ZAPRET_DIR.iterdir()):
+            if child.is_dir() and (child / "bin" / "winws.exe").exists():
+                _merge_move(child, ZAPRET_DIR, [])
+                return _winws_path().exists()
+    except OSError:
+        return False
+    return False
+
+
+def remove_install() -> list[str]:
+    """
+    Полное удаление установленного zapret. Возвращает список файлов/папок,
+    которые удалить не удалось (обычно - занятые драйвером WinDivert до
+    перезагрузки); пустой список = всё удалено.
+    """
+    release_locks()
+    if not ZAPRET_DIR.exists():
+        return []
+    shutil.rmtree(ZAPRET_DIR, ignore_errors=True)
+    if not ZAPRET_DIR.exists():
+        return []
+    leftovers = _clear_dir_contents(ZAPRET_DIR)
+    try:
+        ZAPRET_DIR.rmdir()
+        return []
+    except OSError:
+        return leftovers
 
 
 def _download_file(url: str, dest: Path, progress_cb: ProgressCB) -> None:
@@ -129,17 +269,23 @@ def _download_file(url: str, dest: Path, progress_cb: ProgressCB) -> None:
 
 def _find_extracted_root(extract_dir: Path) -> Path:
     """
-    Архив с GitHub обычно распаковывается либо прямо в корень
-    (bin/, lists/, general.bat, ...), либо в одну вложенную папку.
-    Возвращаем папку, где реально лежит bin/winws.exe.
+    Возвращает папку, в которой реально лежит bin/winws.exe: корень архива,
+    либо его вложенная папка (на глубину до 2 уровней).
     """
-    if (extract_dir / "bin").exists():
-        return extract_dir
-    children = [p for p in extract_dir.iterdir() if p.is_dir()]
-    for child in children:
-        if (child / "bin").exists():
-            return child
-    # fallback: если структура нестандартная - берём как есть
+    candidates = [extract_dir]
+    try:
+        level1 = [p for p in extract_dir.iterdir() if p.is_dir()]
+        candidates += level1
+        for d in level1:
+            candidates += [p for p in d.iterdir() if p.is_dir()]
+    except OSError:
+        pass
+    for c in candidates:
+        if (c / "bin" / "winws.exe").exists():
+            return c
+    for c in candidates:
+        if (c / "bin").exists():
+            return c
     return extract_dir
 
 
@@ -161,6 +307,26 @@ def _restore_user_lists() -> None:
             dst = ZAPRET_DIR / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(backup, dst)
+
+
+def _service_running() -> bool:
+    try:
+        from core import service_manager
+        return service_manager.get_service_status() == "running"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _start_service() -> None:
+    try:
+        subprocess.run(
+            ["sc", "start", "zapret"],
+            capture_output=True,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def install_or_update(progress_cb: ProgressCB = None, release: ReleaseInfo | None = None) -> ReleaseInfo:
@@ -195,32 +361,35 @@ def install_or_update(progress_cb: ProgressCB = None, release: ReleaseInfo | Non
 
     src_root = _find_extracted_root(extract_dir)
 
-    # ВАЖНО: если winws.exe в этот момент запущен (через "Главную" или как
-    # служба), Windows держит файлы в ZAPRET_DIR заблокированными, и
-    # удаление ниже либо частично провалится, либо не удалит сам exe.
-    # Раньше это не проверялось, а ошибка удаления тихо игнорировалась
-    # (ignore_errors=True) - из-за этого новая версия оказывалась не
-    # заменой старой, а ВЛОЖЕННОЙ ВНУТРЬ неудалённой старой папки (новая
-    # подпапка с номером версии рядом со старыми bin/lists), и
-    # is_installed() переставал находить winws.exe в ожидаемом месте.
-    if process_manager.IS_WINDOWS and process_manager.is_running():
-        _report(progress_cb, "Останавливаю zapret перед обновлением...", 0.82)
-        process_manager.stop_all()
+    # Освобождаем файлы: останавливаем winws.exe, службу zapret и драйвер
+    # WinDivert. Если этого не сделать, часть старых файлов остаётся занята.
+    service_was_running = IS_WINDOWS and _service_running()
+    _report(progress_cb, "Останавливаю zapret перед обновлением...", 0.82)
+    release_locks()
 
+    # ВАЖНО: НЕ используем shutil.move(src_root, ZAPRET_DIR) - если ZAPRET_DIR
+    # хоть частично уцелела (занятый драйвером bin/WinDivert64.sys, открытое
+    # в Проводнике окно и т.п.), такой вызов кладёт новую версию ВНУТРЬ неё
+    # как вложенную подпапку, и winws.exe пропадает с ожидаемого пути.
+    # Вместо этого очищаем что получится и вливаем содержимое новой версии.
     _report(progress_cb, "Устанавливаю новую версию...", 0.9)
-    if ZAPRET_DIR.exists():
-        try:
-            shutil.rmtree(ZAPRET_DIR)
-        except OSError as exc:
-            raise InstallerError(
-                "Не удалось удалить предыдущую версию zapret - вероятно, winws.exe "
-                "всё ещё запущен или его файлы заблокированы антивирусом. Закройте "
-                "zapret (кнопка «Отключить» на Главной) и попробуйте ещё раз. "
-                f"Подробности: {exc}"
-            ) from exc
-    shutil.move(str(src_root), str(ZAPRET_DIR))
+    ZAPRET_DIR.mkdir(parents=True, exist_ok=True)
+    _clear_dir_contents(ZAPRET_DIR)
+    failures: list[str] = []
+    _merge_move(src_root, ZAPRET_DIR, failures)
+
+    if not _winws_path().exists():
+        raise InstallerError(
+            "Не удалось установить zapret: файл bin\\winws.exe не появился на месте. "
+            "Скорее всего, старые файлы заняты драйвером WinDivert или антивирусом. "
+            "Перезагрузите компьютер и повторите установку."
+            + (f" Заняты: {', '.join(failures[:3])}" if failures else "")
+        )
 
     _restore_user_lists()
+
+    if service_was_running:
+        _start_service()
 
     # уборка временных файлов
     shutil.rmtree(extract_dir, ignore_errors=True)
