@@ -23,12 +23,29 @@ import sys
 import threading
 import time
 from typing import Callable, Optional
+from pathlib import Path
 
 from core.paths import ZAPRET_DIR
 from core.strategies import Strategy
 
 SERVICE_NAME = "zapret"
 IS_WINDOWS = sys.platform == "win32"
+
+
+def service_belongs_to_install(name: str) -> bool:
+    """Never stop/delete a shared driver or service owned by another install."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"System\CurrentControlSet\Services\{name}") as key:
+            command = str(winreg.QueryValueEx(key, "ImagePath")[0]).strip()
+        path = command.split('"')[1] if command.startswith('"') else command.split()[0]
+        if path.startswith("\\??\\"):
+            path = path[4:]
+        return Path(path).resolve().is_relative_to(ZAPRET_DIR.resolve())
+    except (OSError, ValueError, IndexError):
+        return False
 
 _MARK_MENU = ("Enter choice", "Select option")  # текст меню менялся между версиями service.bat
 _MARK_FILE_INDEX = ("Input file index", "Input option")  # тоже менялся
@@ -134,6 +151,11 @@ def install_as_service(strategy: Strategy, log_cb: LogCB = None) -> tuple[bool, 
     _require_windows()
     if not (ZAPRET_DIR / "service.bat").exists():
         raise ServiceError("Файл service.bat не найден - переустановите zapret.")
+    for name in ("zapret", "WinDivert", "WinDivert14"):
+        result = subprocess.run(["sc", "query", name], capture_output=True,
+                                timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
+        if result.returncode == 0 and not service_belongs_to_install(name):
+            raise ServiceError(f"Служба {name} принадлежит другой установке. Сначала устраните конфликт.")
 
     def log(msg: str) -> None:
         if log_cb:
@@ -175,34 +197,30 @@ def install_as_service(strategy: Strategy, log_cb: LogCB = None) -> tuple[bool, 
 
 
 def remove_service(log_cb: LogCB = None) -> tuple[bool, str]:
-    """Удаляет службу zapret (и связанные службы WinDivert) через меню service.bat."""
+    """Remove only services whose executable belongs to this installation."""
     _require_windows()
-    if not (ZAPRET_DIR / "service.bat").exists():
-        raise ServiceError("Файл service.bat не найден - переустановите zapret.")
-
-    def log(msg: str) -> None:
+    lines = []
+    success = True
+    for name in ("zapret", "WinDivert", "WinDivert14"):
+        query = subprocess.run(["sc", "query", name], capture_output=True,
+                               timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
+        if query.returncode == 1060:
+            continue
+        if query.returncode != 0 or not service_belongs_to_install(name):
+            lines.append(f"Служба {name} пропущена: принадлежность не подтверждена.")
+            if name == "zapret":
+                success = False
+            continue
+        subprocess.run(["sc", "stop", name], capture_output=True,
+                       timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
+        result = subprocess.run(["sc", "delete", name], capture_output=True,
+                                timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
+        ok = result.returncode in (0, 1060, 1072)
+        success = success and ok
+        lines.append(f"{name}: " + ("удалена или отмечена для удаления Windows" if ok else f"ошибка {result.returncode}"))
         if log_cb:
-            log_cb(msg)
-
-    batch = _InteractiveBatch(["cmd.exe", "/c", "service.bat", "admin"], cwd=ZAPRET_DIR)
-    try:
-        log("Открываю service.bat...")
-        if not batch.wait_for(_MARK_MENU, timeout=15):
-            return False, batch.text() + "\n\n[Не дождались главного меню service.bat]"
-
-        log("Выбираю \"Remove Services\"...")
-        batch.send("2")
-
-        batch.wait_for(_MARK_PAUSE, timeout=15)
-        batch.send("")
-
-        batch.wait_for(_MARK_MENU, timeout=10)
-        batch.send("0")
-
-        batch.close()
-        return True, batch.text()
-    finally:
-        batch.close()
+            log_cb(lines[-1])
+    return success, "\n".join(lines)
 
 
 def get_service_status() -> str:

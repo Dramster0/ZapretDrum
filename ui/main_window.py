@@ -25,6 +25,8 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QTextEdit,
     QSystemTrayIcon,
+    QSizePolicy,
+    QStatusBar,
 )
 
 from core import process_manager
@@ -49,9 +51,11 @@ from core.state import load_state, save_state
 from core.strategies import discover_strategies, Strategy, find_strategy
 from core.updater import check_for_updates, UpdateCheckResult
 
-from ui.theme import STYLESHEET, TEXT_PRIMARY, TEXT_SECONDARY, BG_ELEVATED, SUCCESS, DANGER, BORDER, ACCENT
+from ui.theme import STYLESHEET, TEXT_PRIMARY, TEXT_SECONDARY, BG, BG_ELEVATED, SUCCESS, DANGER, BORDER, ACCENT
 from ui.widgets import Card, StrategyRow, PowerButton, StatusDot, make_avatar, nav_button, MainTitleBar, DialogTitleBar, ResizeGrip
+from ui.operations import Operations, exclusive_action
 from ui.workers import (
+    CallWorker,
     InstallWorker,
     FetchReleasesWorker,
     StartStrategyWorker,
@@ -197,8 +201,8 @@ def _show_zapret_conflict_dialog(parent, report: "conflict_detector.ConflictRepo
         "установленный отдельно от ZapretDrum. Это может привести к "
         "конфликтам (например, не получится включить «Установить как "
         "службу», если служба с таким именем уже занята) и просто "
-        "захламляет диск. Рекомендуем удалить найденное - ZapretDrum сам "
-        "скачает и будет управлять своей копией на вкладке «Обновление»."
+        "мешает запуску. Можно остановить найденные процессы и удалить "
+        "подтверждённую стороннюю службу zapret. Все файлы останутся на месте."
     )
     intro.setWordWrap(True)
     layout.addWidget(intro)
@@ -221,7 +225,7 @@ def _show_zapret_conflict_dialog(parent, report: "conflict_detector.ConflictRepo
     layout.addStretch(1)
 
     btn_row = QHBoxLayout()
-    delete_btn = QPushButton("Удалить всё и продолжить")
+    delete_btn = QPushButton("Устранить конфликт")
     delete_btn.setObjectName("dangerButton")
     skip_btn = QPushButton("Не спрашивать больше")
     skip_btn.setObjectName("secondaryButton")
@@ -237,17 +241,17 @@ def _show_zapret_conflict_dialog(parent, report: "conflict_detector.ConflictRepo
     def do_delete() -> None:
         if not _confirm(
             dialog,
-            "Подтверждение удаления",
-            "Найденные процессы, службы и папки будут остановлены и удалены "
-            "безвозвратно. Продолжить?",
-            ok_text="Удалить",
+            "Устранить конфликт?",
+            "Сторонний winws.exe будет остановлен, подтверждённая служба zapret "
+            "будет удалена. Папки и файлы сохранятся. Продолжить?",
+            ok_text="Продолжить",
             danger=True,
         ):
             return
         delete_btn.setEnabled(False)
         skip_btn.setEnabled(False)
         later_btn.setEnabled(False)
-        log = conflict_detector.resolve(report, delete_folders=True)
+        log = conflict_detector.resolve(report)
         result["choice"] = "deleted"
         dialog.accept()
         _show_log_dialog(parent, "Результат очистки", "\n".join(log) or "Нечего было удалять.")
@@ -275,9 +279,9 @@ def _show_tg_conflict_dialog(parent, report: "conflict_detector.TgConflictReport
 
     intro = QLabel(
         "Похоже, на этом компьютере уже есть tg-ws-proxy, установленный "
-        "отдельно от ZapretDrum. Рекомендуем удалить найденное, чтобы не "
-        "запускались две независимые копии одновременно - ZapretDrum сам "
-        "скачает и будет управлять своей копией на вкладке «Telegram»."
+        "отдельно от ZapretDrum. Можно остановить стороннюю копию, чтобы "
+        "запустить свою на вкладке «Telegram». Все файлы и настройки "
+        "сторонней копии останутся на месте."
     )
     intro.setWordWrap(True)
     layout.addWidget(intro)
@@ -298,7 +302,7 @@ def _show_tg_conflict_dialog(parent, report: "conflict_detector.TgConflictReport
     layout.addStretch(1)
 
     btn_row = QHBoxLayout()
-    delete_btn = QPushButton("Удалить всё и продолжить")
+    delete_btn = QPushButton("Остановить стороннюю копию")
     delete_btn.setObjectName("dangerButton")
     skip_btn = QPushButton("Не спрашивать больше")
     skip_btn.setObjectName("secondaryButton")
@@ -314,16 +318,16 @@ def _show_tg_conflict_dialog(parent, report: "conflict_detector.TgConflictReport
     def do_delete() -> None:
         if not _confirm(
             dialog,
-            "Подтверждение удаления",
-            "Найденный процесс и папки будут остановлены и удалены безвозвратно. Продолжить?",
-            ok_text="Удалить",
+            "Остановить стороннюю копию?",
+            "Сторонний tg-ws-proxy будет остановлен. Все папки и файлы сохранятся.",
+            ok_text="Остановить",
             danger=True,
         ):
             return
         delete_btn.setEnabled(False)
         skip_btn.setEnabled(False)
         later_btn.setEnabled(False)
-        log = conflict_detector.resolve_tg(report, delete_folders=True)
+        log = conflict_detector.resolve_tg(report)
         result["choice"] = "deleted"
         dialog.accept()
         _show_log_dialog(parent, "Результат очистки", "\n".join(log) or "Нечего было удалять.")
@@ -366,7 +370,7 @@ def _confirm(
     for btn in (ok_btn, cancel_btn):
         btn.style().unpolish(btn)
         btn.style().polish(btn)
-    box.setDefaultButton(ok_btn)
+    box.setDefaultButton(cancel_btn if danger else ok_btn)
     box.exec()
     return box.clickedButton() is ok_btn
 
@@ -641,6 +645,7 @@ class HomePage(QWidget):
         self.power_button.set_busy(True)
         self.main_window.start_strategy(target)
 
+    @exclusive_action
     def _open_service_menu(self) -> None:
         if not process_manager.IS_WINDOWS:
             QMessageBox.warning(self, "Только Windows", "service.bat запускается только на Windows.")
@@ -648,11 +653,15 @@ class HomePage(QWidget):
         if not is_installed():
             QMessageBox.information(self, "zapret не установлен", "Сначала установите zapret.")
             return
-        subprocess.Popen(
-            ["cmd.exe", "/c", "start", "service.bat", "service.bat"],
-            cwd=str(ZAPRET_DIR),
-        )
+        self.main_window.set_busy(True, "Открыто меню service.bat. Закройте его, чтобы продолжить работу в приложении.")
+        self.menu_worker = CallWorker(lambda: subprocess.call(
+            ["cmd.exe", "/c", "service.bat", "admin"], cwd=str(ZAPRET_DIR),
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+        ))
+        self.menu_worker.finished_error.connect(self._on_service_error)
+        self.main_window.operations.start(self.menu_worker)
 
+    @exclusive_action
     def _on_install_service_clicked(self) -> None:
         if not process_manager.IS_WINDOWS:
             QMessageBox.warning(self, "Только Windows", "Служба Windows доступна только на Windows.")
@@ -686,7 +695,7 @@ class HomePage(QWidget):
         self.install_service_worker.log.connect(lambda msg: self.service_status_label.setText(msg))
         self.install_service_worker.finished_ok.connect(self._on_install_service_finished)
         self.install_service_worker.finished_error.connect(self._on_service_error)
-        self.install_service_worker.start()
+        self.main_window.operations.start(self.install_service_worker)
 
     def _on_install_service_finished(self, success: bool, full_log: str) -> None:
         self.install_service_btn.setEnabled(True)
@@ -708,6 +717,7 @@ class HomePage(QWidget):
                 + '\n\nМожно также открыть "Меню service.bat" и установить вручную.'
             )
 
+    @exclusive_action
     def _on_remove_service_clicked(self) -> None:
         if not process_manager.IS_WINDOWS:
             QMessageBox.warning(self, "Только Windows", "Служба Windows доступна только на Windows.")
@@ -731,14 +741,17 @@ class HomePage(QWidget):
         self.remove_service_worker.log.connect(lambda msg: self.service_status_label.setText(msg))
         self.remove_service_worker.finished_ok.connect(self._on_remove_service_finished)
         self.remove_service_worker.finished_error.connect(self._on_service_error)
-        self.remove_service_worker.start()
+        self.main_window.operations.start(self.remove_service_worker)
 
     def _on_remove_service_finished(self, success: bool, full_log: str) -> None:
         self.install_service_btn.setEnabled(True)
         self.remove_service_btn.setEnabled(True)
         self.main_window.set_busy(False)
         self._refresh_service_status()
-        QMessageBox.information(self, "Готово", "Служба удалена.")
+        if success:
+            QMessageBox.information(self, "Готово", full_log or "Служба не установлена.")
+        else:
+            QMessageBox.warning(self, "Удаление не завершено", full_log)
 
     def _on_service_error(self, message: str) -> None:
         self.install_service_btn.setEnabled(True)
@@ -852,6 +865,7 @@ class AutoTestPage(QWidget):
         scroll.setWidget(self.results_container)
         root.addWidget(scroll, 1)
 
+    @exclusive_action
     def start_test(self) -> None:
         if not is_installed():
             QMessageBox.information(self, "zapret не установлен", "Сначала установите zapret на странице «Обновление».")
@@ -872,7 +886,7 @@ class AutoTestPage(QWidget):
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_ok.connect(self._on_finished)
         self.worker.finished_error.connect(self._on_error)
-        self.worker.start()
+        self.main_window.operations.start(self.worker)
         self.main_window.set_busy(True, "Идёт автотест стратегий...")
 
     def cancel_test(self) -> None:
@@ -1063,8 +1077,18 @@ class TelegramPage(QWidget):
         self.tg_update_card.body.addWidget(update_title)
 
         self.tg_latest_label = QLabel("Последняя версия: —")
+        self.tg_latest_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.tg_latest_label.setWordWrap(True)
+        self.tg_latest_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.tg_latest_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
         self.tg_update_card.body.addWidget(self.tg_latest_label)
+        self._tg_check_error = ""
+        self.tg_error_details_btn = QPushButton("Подробности ошибки")
+        self.tg_error_details_btn.setObjectName("secondaryButton")
+        self.tg_error_details_btn.clicked.connect(
+            lambda: _show_log_dialog(self, "Ошибка проверки обновлений", self._tg_check_error))
+        self.tg_error_details_btn.setVisible(False)
+        self.tg_update_card.body.addWidget(self.tg_error_details_btn)
 
         self.tg_update_progress_bar = QProgressBar()
         self.tg_update_progress_bar.setRange(0, 100)
@@ -1207,6 +1231,7 @@ class TelegramPage(QWidget):
         self.stop_button.setEnabled(running)
 
     # ------------------------------------------------------------------ #
+    @exclusive_action
     def _on_install_clicked(self) -> None:
         self.install_button.setEnabled(False)
         self.install_progress_bar.setVisible(True)
@@ -1218,7 +1243,7 @@ class TelegramPage(QWidget):
         self.install_worker.progress.connect(self._on_install_progress)
         self.install_worker.finished_ok.connect(self._on_install_finished)
         self.install_worker.finished_error.connect(self._on_install_error)
-        self.install_worker.start()
+        self.main_window.operations.start(self.install_worker)
 
     def _on_install_progress(self, msg: str, frac: float) -> None:
         self.install_progress_label.setText(msg)
@@ -1242,25 +1267,27 @@ class TelegramPage(QWidget):
         QMessageBox.warning(self, "Ошибка установки", message)
 
     # ------------------------------------------------------------------ #
+    @exclusive_action
     def _on_start_clicked(self) -> None:
         self.start_button.setEnabled(False)
         self.main_window.set_busy(True, "Запускаю tg-ws-proxy...")
         self.start_worker = TgStartWorker()
         self.start_worker.finished_ok.connect(self._on_start_ok)
         self.start_worker.finished_error.connect(self._on_worker_error)
-        self.start_worker.start()
+        self.main_window.operations.start(self.start_worker)
 
     def _on_start_ok(self) -> None:
         self.main_window.set_busy(False)
         self.refresh()
 
+    @exclusive_action
     def _on_stop_clicked(self) -> None:
         self.stop_button.setEnabled(False)
         self.main_window.set_busy(True, "Останавливаю tg-ws-proxy...")
         self.stop_worker = TgStopWorker()
         self.stop_worker.finished_ok.connect(self._on_stop_ok)
         self.stop_worker.finished_error.connect(self._on_worker_error)
-        self.stop_worker.start()
+        self.main_window.operations.start(self.stop_worker)
 
     def _on_stop_ok(self) -> None:
         self.main_window.set_busy(False)
@@ -1272,6 +1299,7 @@ class TelegramPage(QWidget):
         QMessageBox.warning(self, "Ошибка", message)
 
     # ------------------------------------------------------------------ #
+    @exclusive_action
     def _on_enable_autostart(self) -> None:
         try:
             tg_manager.enable_autostart()
@@ -1279,25 +1307,36 @@ class TelegramPage(QWidget):
             QMessageBox.warning(self, "Ошибка", str(exc))
         self.refresh()
 
+    @exclusive_action
     def _on_disable_autostart(self) -> None:
         tg_manager.disable_autostart()
         self.refresh()
 
     # ------------------------------------------------------------------ #
+    @exclusive_action
     def _on_check_update_clicked(self) -> None:
         self.tg_check_update_btn.setEnabled(False)
+        self.tg_do_update_btn.setEnabled(False)
+        self._pending_tg_release = None
+        self._tg_check_error = ""
+        self.tg_error_details_btn.setVisible(False)
         self.tg_latest_label.setText("Проверяю...")
         self.main_window.set_busy(True, "Проверяю обновления tg-ws-proxy...")
-        QTimer.singleShot(50, self._do_check_update)
+        self.check_worker = CallWorker(tg_installer.fetch_latest_release)
+        self.check_worker.finished_ok.connect(self._do_check_update)
+        self.check_worker.finished_error.connect(self._on_check_update_error)
+        self.main_window.operations.start(self.check_worker)
 
-    def _do_check_update(self) -> None:
+    def _on_check_update_error(self, message: str) -> None:
+        self.tg_check_update_btn.setEnabled(True)
+        self._tg_check_error = message
+        self.tg_latest_label.setText(
+            "Не удалось проверить обновления. Проверьте подключение и повторите попытку.")
+        self.tg_error_details_btn.setVisible(True)
+
+    def _do_check_update(self, latest) -> None:
         self.tg_check_update_btn.setEnabled(True)
         self.main_window.set_busy(False)
-        try:
-            latest = tg_installer.fetch_latest_release()
-        except tg_installer.TgInstallerError as exc:
-            self.tg_latest_label.setText(f"Не удалось проверить: {exc}")
-            return
 
         self._pending_tg_release = latest
         installed = load_state().tg_installed_version
@@ -1310,6 +1349,7 @@ class TelegramPage(QWidget):
             self.tg_do_update_btn.setEnabled(False)
             self.tg_do_update_btn.setText("Скачать и установить")
 
+    @exclusive_action
     def _on_do_update_clicked(self) -> None:
         self.tg_do_update_btn.setEnabled(False)
         self.tg_check_update_btn.setEnabled(False)
@@ -1322,7 +1362,7 @@ class TelegramPage(QWidget):
         self.install_worker.progress.connect(self._on_update_progress)
         self.install_worker.finished_ok.connect(self._on_update_finished)
         self.install_worker.finished_error.connect(self._on_update_error)
-        self.install_worker.start()
+        self.main_window.operations.start(self.install_worker)
 
     def _on_update_progress(self, msg: str, frac: float) -> None:
         self.tg_update_progress_label.setText(msg)
@@ -1348,6 +1388,7 @@ class TelegramPage(QWidget):
         QMessageBox.warning(self, "Ошибка обновления", message)
 
     # ------------------------------------------------------------------ #
+    @exclusive_action
     def _on_delete_completely(self) -> None:
         if not _confirm(
             self,
@@ -1399,8 +1440,18 @@ class UpdatePage(QWidget):
         card = Card()
         self.installed_label = QLabel("Установленная версия: —")
         self.latest_label = QLabel("Последняя версия: —")
+        self.latest_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.latest_label.setWordWrap(True)
+        self.latest_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         card.body.addWidget(self.installed_label)
         card.body.addWidget(self.latest_label)
+        self._check_error = ""
+        self.error_details_btn = QPushButton("Подробности ошибки")
+        self.error_details_btn.setObjectName("secondaryButton")
+        self.error_details_btn.clicked.connect(
+            lambda: _show_log_dialog(self, "Ошибка проверки обновлений", self._check_error))
+        self.error_details_btn.setVisible(False)
+        card.body.addWidget(self.error_details_btn)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -1440,14 +1491,30 @@ class UpdatePage(QWidget):
 
         root.addStretch(1)
 
+    @exclusive_action
     def check_updates(self) -> None:
         self.check_button.setEnabled(False)
+        self._check_error = ""
+        self.error_details_btn.setVisible(False)
+        self.latest_label.setText("Проверяю обновления…")
         self.installed_label.setText("Установленная версия: проверка...")
         self.main_window.set_busy(True, "Проверяю обновления...")
-        QTimer.singleShot(50, self._do_check)
+        self.check_worker = CallWorker(check_for_updates)
+        self.check_worker.finished_ok.connect(self._do_check)
+        self.check_worker.finished_error.connect(self._on_check_error)
+        self.main_window.operations.start(self.check_worker)
 
-    def _do_check(self) -> None:
-        result: UpdateCheckResult = check_for_updates()
+    def _on_check_error(self, message: str) -> None:
+        self.check_button.setEnabled(True)
+        self.main_window.set_busy(False)
+        self.installed_label.setText(
+            f"Установленная версия: {load_state().installed_version or 'не установлена'}")
+        self._check_error = message
+        self.latest_label.setText(
+            "Не удалось проверить обновления. Проверьте подключение и повторите попытку.")
+        self.error_details_btn.setVisible(True)
+
+    def _do_check(self, result: UpdateCheckResult) -> None:
         self.check_button.setEnabled(True)
         self.main_window.set_busy(False)
 
@@ -1455,7 +1522,7 @@ class UpdatePage(QWidget):
             f"Установленная версия: {result.installed_version or 'не установлена'}"
         )
         if result.error:
-            self.latest_label.setText(f"Не удалось проверить: {result.error}")
+            self._on_check_error(result.error)
             return
 
         self.latest_label.setText(f"Последняя версия: {result.latest.tag_name}")
@@ -1464,6 +1531,7 @@ class UpdatePage(QWidget):
         else:
             self.update_button.setText("У вас последняя версия (переустановить)")
 
+    @exclusive_action
     def choose_version(self) -> None:
         self.choose_version_button.setEnabled(False)
         self.main_window.set_busy(True, "Загружаю список версий...")
@@ -1471,7 +1539,7 @@ class UpdatePage(QWidget):
         self.fetch_releases_worker = FetchReleasesWorker()
         self.fetch_releases_worker.finished_ok.connect(self._on_versions_fetched)
         self.fetch_releases_worker.finished_error.connect(self._on_versions_error)
-        self.fetch_releases_worker.start()
+        self.main_window.operations.start(self.fetch_releases_worker)
 
     def _on_versions_fetched(self, releases: list) -> None:
         self.choose_version_button.setEnabled(True)
@@ -1517,7 +1585,10 @@ class UpdatePage(QWidget):
             install_btn = QPushButton("Установить")
             install_btn.setObjectName("secondaryButton")
             install_btn.clicked.connect(
-                lambda _checked, r=release: (dialog.accept(), self.run_update(r))
+                lambda _checked, r=release: (
+                    self.main_window.operations.defer(lambda: self.run_update(r)),
+                    dialog.accept(),
+                )
             )
             row.addWidget(install_btn)
 
@@ -1535,10 +1606,8 @@ class UpdatePage(QWidget):
         self.main_window.set_busy(False)
         QMessageBox.warning(self, "Ошибка", message)
 
+    @exclusive_action
     def run_update(self, release: ReleaseInfo | None) -> None:
-        if process_manager.IS_WINDOWS and process_manager.is_running():
-            process_manager.stop_all()
-
         self.update_button.setEnabled(False)
         self.check_button.setEnabled(False)
         self.choose_version_button.setEnabled(False)
@@ -1552,7 +1621,7 @@ class UpdatePage(QWidget):
         self.install_worker.progress.connect(self._on_progress)
         self.install_worker.finished_ok.connect(self._on_finished)
         self.install_worker.finished_error.connect(self._on_error)
-        self.install_worker.start()
+        self.main_window.operations.start(self.install_worker)
 
     def _on_progress(self, msg: str, frac: float) -> None:
         self.progress_label.setText(msg)
@@ -1568,10 +1637,16 @@ class UpdatePage(QWidget):
         self.choose_version_button.setEnabled(True)
         self.installed_label.setText(f"Установленная версия: {release.tag_name}")
         self.latest_label.setText(f"Последняя версия: {release.tag_name}")
+        self._check_error = ""
+        self.error_details_btn.setVisible(False)
         self.update_button.setText("У вас последняя версия (переустановить)")
         self.main_window.set_busy(False)
         self.main_window.notify_installed()
-        QMessageBox.information(self, "Готово", f"zapret установлен, версия {release.tag_name}.")
+        message = f"zapret установлен, версия {release.tag_name}."
+        if release.warning:
+            QMessageBox.warning(self, "Установлено с предупреждением", message + "\n\n" + release.warning)
+        else:
+            QMessageBox.information(self, "Готово", message)
 
     def _on_error(self, message: str) -> None:
         self.update_button.setEnabled(True)
@@ -1691,6 +1766,7 @@ class SettingsPage(QWidget):
 
         root.addStretch(1)
 
+    @exclusive_action
     def _check_app_update(self) -> None:
         self.check_app_update_btn.setEnabled(False)
         self.install_app_update_btn.setEnabled(False)
@@ -1700,7 +1776,7 @@ class SettingsPage(QWidget):
         self.check_app_update_worker = CheckAppUpdateWorker()
         self.check_app_update_worker.finished_ok.connect(self._on_app_update_checked)
         self.check_app_update_worker.finished_error.connect(self._on_app_update_error)
-        self.check_app_update_worker.start()
+        self.main_window.operations.start(self.check_app_update_worker)
 
     def _on_app_update_checked(self, release) -> None:
         self.check_app_update_btn.setEnabled(True)
@@ -1729,12 +1805,15 @@ class SettingsPage(QWidget):
     def _on_app_update_error(self, message: str) -> None:
         self.check_app_update_btn.setEnabled(True)
         self.main_window.set_busy(False)
-        self.app_update_status_label.setText("Ошибка проверки.")
+        self.app_update_status_label.setText("Обновление не завершено. Можно повторить попытку.")
+        self.install_app_update_btn.setEnabled(self._pending_app_release is not None)
         QMessageBox.warning(self, "Ошибка", message)
 
+    @exclusive_action
     def _install_app_update(self) -> None:
         if self._pending_app_release is None:
             return
+        app_updater.installed_app_directory()
 
         confirm = _confirm(
             self, "Обновить ZapretDrum?",
@@ -1756,7 +1835,7 @@ class SettingsPage(QWidget):
         self.download_app_update_worker.progress.connect(self._on_app_update_progress)
         self.download_app_update_worker.finished_ok.connect(self._on_app_update_downloaded)
         self.download_app_update_worker.finished_error.connect(self._on_app_update_error)
-        self.download_app_update_worker.start()
+        self.main_window.operations.start(self.download_app_update_worker)
 
     def _on_app_update_progress(self, msg: str, frac: float) -> None:
         self.app_update_status_label.setText(msg)
@@ -1770,30 +1849,23 @@ class SettingsPage(QWidget):
             "автоматически начнётся в фоне. Подождите несколько секунд и "
             "откройте приложение снова через ярлык или меню Пуск.",
         )
-        try:
-            app_updater.launch_installer_after_app_exit(Path(setup_path))
-        except app_updater.AppUpdateError as exc:
-            self.check_app_update_btn.setEnabled(True)
-            self.install_app_update_btn.setEnabled(True)
-            self.main_window.set_busy(False)
-            QMessageBox.warning(self, "Не удалось запустить установку", str(exc))
-            return
-        QApplication.instance().quit()
+        self.main_window.request_exit(after_exit=lambda: app_updater.launch_installer_after_app_exit(
+            Path(setup_path), self._pending_app_release.version
+        ))
 
+    @exclusive_action
     def _reinstall(self) -> None:
         confirm = _confirm(
             self,
             "Переустановить zapret?",
-            "Текущая установка будет удалена и скачана заново. Продолжить?",
+            "Новый комплект будет скачан и заменит текущий после проверки. "
+            "Пользовательские списки доменов сохранятся. Продолжить?",
         )
         if confirm:
-            from core import installer
-
-            # Установка теперь устойчива к остаткам, так что даже если часть
-            # файлов занята драйвером - новая версия встанет корректно.
-            installer.remove_install()
+            self.main_window.operations.defer(lambda: self.main_window.update_page.run_update(None))
             self.main_window.go_to("update")
 
+    @exclusive_action
     def _check_conflicts_manually(self) -> None:
         if not process_manager.IS_WINDOWS:
             QMessageBox.information(self, "Недоступно", "Эта проверка доступна только на Windows.")
@@ -1807,6 +1879,7 @@ class SettingsPage(QWidget):
             return
         _show_zapret_conflict_dialog(self, report)
 
+    @exclusive_action
     def _delete_zapret_completely(self) -> None:
         confirm = _confirm(
             self,
@@ -1826,9 +1899,12 @@ class SettingsPage(QWidget):
         if process_manager.IS_WINDOWS and service_manager.get_service_status() != "not_installed":
             self.main_window.set_busy(True, "Удаляю службу перед удалением zapret...")
             self._delete_service_worker = RemoveServiceWorker()
-            self._delete_service_worker.finished_ok.connect(lambda *_: self._finish_delete_zapret())
-            self._delete_service_worker.finished_error.connect(lambda *_: self._finish_delete_zapret())
-            self._delete_service_worker.start()
+            self._delete_service_worker.finished_ok.connect(
+                lambda success, log: self._finish_delete_zapret() if success
+                else QMessageBox.warning(self, "Удаление остановлено", log))
+            self._delete_service_worker.finished_error.connect(
+                lambda message: QMessageBox.warning(self, "Удаление остановлено", message))
+            self.main_window.operations.start(self._delete_service_worker)
         else:
             self._finish_delete_zapret()
 
@@ -1842,15 +1918,20 @@ class SettingsPage(QWidget):
                 self,
                 "Удалено не полностью",
                 "Часть файлов удалить не удалось - скорее всего, их держит драйвер "
-                "WinDivert или антивирус. Они удалятся после перезагрузки компьютера "
-                "(либо перезапишутся при следующей установке zapret).\n\n"
+                "WinDivert или антивирус. Перезагрузите компьютер и повторите удаление.\n\n"
                 + "\n".join(leftovers[:5]),
             )
         else:
+            state = load_state()
+            state.installed_version = None
+            state.last_strategy = None
+            state.last_test_results = []
+            save_state(state)
             QMessageBox.information(self, "Готово", "zapret удалён.")
         self.main_window.notify_installed()
         self.main_window.go_to("home")
 
+    @exclusive_action
     def _uninstall(self) -> None:
         if not process_manager.IS_WINDOWS:
             QMessageBox.warning(self, "Только Windows", "Удаление доступно только на Windows.")
@@ -1883,8 +1964,7 @@ class SettingsPage(QWidget):
         if process_manager.is_running():
             process_manager.stop_all()
 
-        subprocess.Popen([str(uninstaller)])
-        QApplication.instance().quit()
+        self.main_window.request_exit(after_exit=lambda: subprocess.Popen([str(uninstaller)]))
 
 
 # --------------------------------------------------------------------------- #
@@ -2077,6 +2157,9 @@ def _is_admin() -> bool:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.operations = Operations(self)
+        self._exit_requested = False
+        self._exit_action = None
         self.setWindowTitle("ZapretDrum — обход блокировок Discord/YouTube")
         self.resize(1120, 680)
         self.setStyleSheet(STYLESHEET)
@@ -2097,7 +2180,7 @@ class MainWindow(QMainWindow):
         open_action = QAction("Открыть ZapretDrum", self)
         open_action.triggered.connect(self._restore_from_tray)
         exit_action = QAction("Выход", self)
-        exit_action.triggered.connect(QApplication.quit)
+        exit_action.triggered.connect(self.request_exit)
         tray_menu.addAction(open_action)
         tray_menu.addSeparator()
         tray_menu.addAction(exit_action)
@@ -2111,6 +2194,20 @@ class MainWindow(QMainWindow):
         # обращений к нативному API Windows.
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+        # Reserve this space before the first show. QMainWindow.statusBar()
+        # otherwise creates it lazily on the first operation. The central
+        # widget does not paint this strip in a translucent frameless window.
+        status_bar = QStatusBar(self)
+        status_bar.setSizeGripEnabled(False)
+        status_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        status_bar.setStyleSheet(
+            f"QStatusBar {{ background-color: {BG}; color: {TEXT_SECONDARY}; "
+            "border: none; border-radius: 0px; }"
+            "QStatusBar::item { border: none; }"
+        )
+        status_bar.setFixedHeight(status_bar.fontMetrics().height() + 10)
+        self.setStatusBar(status_bar)
 
         self.start_worker: StartStrategyWorker | None = None
         self.stop_worker: StopWorker | None = None
@@ -2252,6 +2349,13 @@ class MainWindow(QMainWindow):
         zapret-discord-youtube, установленного отдельно от ZapretDrum, и
         предлагает его удалить, чтобы не было конфликтов служб/процессов.
         """
+        if self.operations.active or self.has_modal_dialog():
+            QTimer.singleShot(1000, self._check_zapret_conflicts)
+            return
+        self._run_zapret_conflict_check()
+
+    @exclusive_action
+    def _run_zapret_conflict_check(self) -> None:
         try:
             if not process_manager.IS_WINDOWS:
                 return
@@ -2264,7 +2368,7 @@ class MainWindow(QMainWindow):
                 return
 
             choice = _show_zapret_conflict_dialog(self, report)
-            if choice in ("deleted", "skipped"):
+            if choice == "skipped":
                 state = load_state()
                 state.zapret_conflict_dismissed = True
                 save_state(state)
@@ -2276,6 +2380,13 @@ class MainWindow(QMainWindow):
 
     def _check_tg_conflicts(self) -> None:
         """То же самое, что _check_zapret_conflicts, но для tg-ws-proxy."""
+        if self.operations.active or self.has_modal_dialog():
+            QTimer.singleShot(1000, self._check_tg_conflicts)
+            return
+        self._run_tg_conflict_check()
+
+    @exclusive_action
+    def _run_tg_conflict_check(self) -> None:
         if not process_manager.IS_WINDOWS:
             return
         state = load_state()
@@ -2287,7 +2398,7 @@ class MainWindow(QMainWindow):
             return
 
         choice = _show_tg_conflict_dialog(self, report)
-        if choice in ("deleted", "skipped"):
+        if choice == "skipped":
             state = load_state()
             state.tg_conflict_dismissed = True
             save_state(state)
@@ -2299,21 +2410,67 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.pages[key])
         if key == "autotest" and auto_start:
             self.autotest_page.start_test()
-        if key == "domains":
+        if key == "domains" and not self.operations.active:
             self.domains_page.reload()
-        if key == "telegram":
+        if key == "telegram" and not self.operations.active:
             self.telegram_page.refresh()
 
     def set_busy(self, busy: bool, message: str = "") -> None:
         self.statusBar().showMessage(message if busy else "", 0)
 
+    def has_modal_dialog(self) -> bool:
+        return QApplication.activeModalWidget() is not None
+
+    def set_operation_enabled(self, enabled: bool, owner=None) -> None:
+        for page in self.pages.values():
+            page.setEnabled(enabled or page is self.autotest_page and owner is page)
+        self.version_btn.setEnabled(enabled)
+        self.autotest_page.results_container.setEnabled(enabled)
+        if not enabled:
+            self.status_timer.stop()
+        else:
+            self.status_timer.start(2000)
+            self._refresh_status()
+
+    def request_exit(self, checked=False, after_exit=None) -> None:
+        if self.has_modal_dialog():
+            return
+        self._exit_requested = True
+        self._exit_action = after_exit
+        if self.operations.active or self.operations.workers:
+            if self.autotest_page.worker and self.autotest_page.worker.isRunning():
+                self.autotest_page.worker.cancel()
+            self.statusBar().showMessage("Завершение текущей операции перед выходом…")
+            return
+        self.finish_pending_exit()
+
+    def finish_pending_exit(self) -> None:
+        if not self._exit_requested or self.operations.active or self.operations.workers:
+            return
+        if self._exit_action:
+            try:
+                self._exit_action()
+            except Exception as exc:
+                self._exit_requested = False
+                self._exit_action = None
+                self.settings_page.check_app_update_btn.setEnabled(True)
+                self.settings_page.install_app_update_btn.setEnabled(
+                    self.settings_page._pending_app_release is not None)
+                QMessageBox.warning(self, "Не удалось завершить действие", str(exc))
+                return
+        self.status_timer.stop()
+        self.tray_icon.hide()
+        # Explicit exit bypasses the close-to-tray handler. Workers are done.
+        QApplication.instance().exit(0)
+
+    @exclusive_action
     def _show_changelog(self) -> None:
         self.version_btn.setEnabled(False)
         self.set_busy(True, "Загружаю список изменений...")
         self._changelog_worker = FetchChangelogWorker()
         self._changelog_worker.finished_ok.connect(self._on_changelog_fetched)
         self._changelog_worker.finished_error.connect(self._on_changelog_error)
-        self._changelog_worker.start()
+        self.operations.start(self._changelog_worker)
 
     def _on_changelog_fetched(self, entries: list) -> None:
         self.version_btn.setEnabled(True)
@@ -2331,6 +2488,7 @@ class MainWindow(QMainWindow):
         self._refresh_status()
 
     # ------------------------------------------------------------------ #
+    @exclusive_action
     def start_strategy(self, strategy: Strategy) -> None:
         if not process_manager.IS_WINDOWS:
             QMessageBox.warning(
@@ -2343,7 +2501,7 @@ class MainWindow(QMainWindow):
         self.start_worker = StartStrategyWorker(strategy)
         self.start_worker.finished_ok.connect(self._on_start_ok)
         self.start_worker.finished_error.connect(self._on_worker_error)
-        self.start_worker.start()
+        self.operations.start(self.start_worker)
 
     def _on_start_ok(self, file_name: str) -> None:
         state = load_state()
@@ -2352,6 +2510,7 @@ class MainWindow(QMainWindow):
         self.set_busy(False)
         self._refresh_status()
 
+    @exclusive_action
     def stop_strategy(self) -> None:
         if not process_manager.IS_WINDOWS:
             return
@@ -2359,7 +2518,7 @@ class MainWindow(QMainWindow):
         self.stop_worker = StopWorker()
         self.stop_worker.finished_ok.connect(lambda: (self.set_busy(False), self._refresh_status()))
         self.stop_worker.finished_error.connect(self._on_worker_error)
-        self.stop_worker.start()
+        self.operations.start(self.stop_worker)
 
     def _on_worker_error(self, message: str) -> None:
         self.set_busy(False)
@@ -2378,7 +2537,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def closeEvent(self, event) -> None:
         """Закрытие окна скрывает приложение в трей; выход доступен из меню трея."""
-        if self.tray_icon.isVisible():
+        if self.tray_icon.isVisible() and QSystemTrayIcon.isSystemTrayAvailable():
             event.ignore()
             self.hide()
             self.tray_icon.showMessage(
@@ -2388,10 +2547,14 @@ class MainWindow(QMainWindow):
                 2500,
             )
             return
-        super().closeEvent(event)
+        event.ignore()
+        self.request_exit()
 
     def _restore_from_tray(self) -> None:
-        self.show()
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
         self.raise_()
         self.activateWindow()
 

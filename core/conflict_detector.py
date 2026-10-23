@@ -13,11 +13,10 @@ C:\\tg-ws-proxy и т.п.). У zapret ещё бывает служба Windows, 
 
 Модуль только НАХОДИТ такие вещи (detect/detect_tg) - ничего не удаляет и
 не останавливает сам. Решение и подтверждение - на пользователе, через
-диалог в UI; удаление делает отдельная функция (resolve/resolve_tg).
+диалог в UI. resolve/resolve_tg устраняют конфликт, сохраняя сторонние файлы.
 """
 from __future__ import annotations
 
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -29,10 +28,9 @@ from core.paths import ZAPRET_DIR, TG_DIR
 
 IS_WINDOWS = sys.platform == "win32"
 
-# Имена служб, которые создаёт штатный service.bat из состава
-# zapret-discord-youtube (то же самое, что core.service_manager.SERVICE_NAME
-# и что чистит наш собственный installer/setup.iss при удалении).
-KNOWN_SERVICE_NAMES = ("zapret", "WinDivert", "WinDivert14")
+# WinDivert is shared by other applications: never treat it as a foreign
+# installation that can be removed merely because the driver exists.
+KNOWN_SERVICE_NAMES = ("zapret",)
 
 # Куда чаще всего люди вручную распаковывают zapret - проверяем сам путь
 # и один уровень вложенных папок, без рекурсивного обхода всего диска.
@@ -64,7 +62,7 @@ class ConflictReport:
     folders: list[Path] = field(default_factory=list)
 
     def is_empty(self) -> bool:
-        return not (self.processes or self.services or self.folders)
+        return not (self.processes or self.services)
 
 
 def _own_dir() -> Path | None:
@@ -140,8 +138,7 @@ def _find_services() -> list[FoundService]:
             )
         except Exception:
             continue
-        out = (result.stdout or "") + (result.stderr or "")
-        if "does not exist" in out.lower():
+        if result.returncode != 0:
             continue
 
         binary_path = _service_binary_path(name) or "?"
@@ -217,11 +214,26 @@ def detect() -> ConflictReport:
     return ConflictReport(processes=processes, services=services, folders=folders)
 
 
-def resolve(report: ConflictReport, delete_folders: bool = True) -> list[str]:
+def _stop_reported_process(proc: FoundProcess, prefix: str) -> None:
+    """Recheck the executable before terminating a PID from an older report."""
+    process = psutil.Process(proc.pid)
+    if proc.exe_path == "?" or not process.name().lower().startswith(prefix):
+        raise ValueError("Не удалось подтвердить принадлежность процесса; пропущен.")
+    if Path(process.exe()).resolve() != Path(proc.exe_path).resolve():
+        raise ValueError("Процесс изменился после проверки; пропущен.")
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except psutil.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def resolve(report: ConflictReport) -> list[str]:
     """
     Устраняет найденное: останавливает чужие процессы winws.exe,
-    останавливает и удаляет конфликтующие службы, и (если
-    delete_folders=True) удаляет найденные папки с файлами. Не бросает
+    останавливает и удаляет подтверждённую службу zapret.
+    Сторонние файлы никогда не удаляет. Не бросает
     исключения - возвращает построчный лог того, что получилось и что
     нет, для показа пользователю.
     """
@@ -232,42 +244,40 @@ def resolve(report: ConflictReport, delete_folders: bool = True) -> list[str]:
 
     for proc in report.processes:
         try:
-            p = psutil.Process(proc.pid)
-            p.terminate()
-            try:
-                p.wait(timeout=5)
-            except psutil.TimeoutExpired:
-                p.kill()
+            _stop_reported_process(proc, "winws.exe")
             log.append(f"Процесс winws.exe (PID {proc.pid}) остановлен.")
-        except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+        except (psutil.Error, OSError, ValueError) as exc:
             log.append(f"Не удалось остановить процесс PID {proc.pid}: {exc}")
 
     for svc in report.services:
         try:
+            current_path = _service_binary_path(svc.name)
+            if svc.name != "zapret" or not current_path or current_path != svc.binary_path:
+                raise ValueError("Принадлежность службы не подтверждена; пропущена.")
+            exe = _parse_exe_from_image_path(current_path)
+            if exe is None or exe.name.lower() != "winws.exe" or not _is_foreign(exe):
+                raise ValueError("Служба не является сторонним zapret; пропущена.")
             subprocess.run(
                 ["net", "stop", svc.name],
                 capture_output=True,
                 timeout=15,
                 creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
             )
-            subprocess.run(
+            result = subprocess.run(
                 ["sc", "delete", svc.name],
                 capture_output=True,
                 text=True,
                 timeout=15,
                 creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
             )
+            if result.returncode != 0:
+                raise OSError(f"Windows вернула код {result.returncode}")
             log.append(f'Служба "{svc.name}" удалена.')
         except Exception as exc:  # noqa: BLE001
             log.append(f'Не удалось удалить службу "{svc.name}": {exc}')
 
-    if delete_folders:
-        for folder in report.folders:
-            try:
-                shutil.rmtree(folder)
-                log.append(f"Папка удалена: {folder}")
-            except Exception as exc:  # noqa: BLE001
-                log.append(f"Не удалось удалить папку {folder}: {exc}")
+    for folder in report.folders:
+        log.append(f"Файлы сохранены: {folder}")
 
     return log
 
@@ -297,7 +307,7 @@ class TgConflictReport:
     folders: list[Path] = field(default_factory=list)
 
     def is_empty(self) -> bool:
-        return not (self.processes or self.folders)
+        return not self.processes
 
 
 def _own_tg_dir() -> Path | None:
@@ -386,9 +396,9 @@ def detect_tg() -> TgConflictReport:
     return TgConflictReport(processes=processes, folders=folders)
 
 
-def resolve_tg(report: TgConflictReport, delete_folders: bool = True) -> list[str]:
-    """Останавливает чужие процессы tg-ws-proxy и (если delete_folders=True)
-    удаляет найденные папки с файлами. Не бросает исключения - возвращает
+def resolve_tg(report: TgConflictReport) -> list[str]:
+    """Останавливает чужие процессы tg-ws-proxy, сохраняя все их файлы.
+    Не бросает исключения - возвращает
     построчный лог для показа пользователю."""
     if not IS_WINDOWS:
         return []
@@ -397,22 +407,12 @@ def resolve_tg(report: TgConflictReport, delete_folders: bool = True) -> list[st
 
     for proc in report.processes:
         try:
-            p = psutil.Process(proc.pid)
-            p.terminate()
-            try:
-                p.wait(timeout=5)
-            except psutil.TimeoutExpired:
-                p.kill()
+            _stop_reported_process(proc, _TG_PROCESS_NAME_PREFIX)
             log.append(f"Процесс tg-ws-proxy (PID {proc.pid}) остановлен.")
-        except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+        except (psutil.Error, OSError, ValueError) as exc:
             log.append(f"Не удалось остановить процесс PID {proc.pid}: {exc}")
 
-    if delete_folders:
-        for folder in report.folders:
-            try:
-                shutil.rmtree(folder)
-                log.append(f"Папка удалена: {folder}")
-            except Exception as exc:  # noqa: BLE001
-                log.append(f"Не удалось удалить папку {folder}: {exc}")
+    for folder in report.folders:
+        log.append(f"Файлы сохранены: {folder}")
 
     return log

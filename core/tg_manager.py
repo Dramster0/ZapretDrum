@@ -70,8 +70,8 @@ def _matches(proc: psutil.Process) -> bool:
             try:
                 return Path(exe).resolve().parent == TG_DIR.resolve()
             except OSError:
-                return True
-        return True
+                return False
+        return False
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False
 
@@ -114,6 +114,11 @@ def stop(timeout: float = 5.0) -> None:
             p.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
+
+
+    _, remaining = psutil.wait_procs(alive, timeout=timeout)
+    if remaining:
+        raise TgManagerError("Не удалось остановить свою копию tg-ws-proxy. Повторите попытку.")
 
 
 def _autostart_shortcut_path() -> Path:
@@ -260,4 +265,7 @@ def delete_completely() -> None:
     disable_autostart()
 
     if TG_DIR.exists():
-        shutil.rmtree(TG_DIR, ignore_errors=True)
+        try:
+            shutil.rmtree(TG_DIR)
+        except OSError as exc:
+            raise TgManagerError(f"Не все файлы удалены из {TG_DIR}: {exc}") from exc

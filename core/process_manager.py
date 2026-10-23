@@ -5,7 +5,7 @@
 поэтому нам достаточно:
   - для запуска: выполнить .bat файл (он вернёт управление почти сразу,
     а winws.exe останется работать в фоне свёрнутым);
-  - для остановки: найти и завершить все процессы winws.exe.
+  - для остановки: завершить winws.exe из папки нашей установки.
 
 Модуль работает только на Windows; на других ОС вызовы - no-op с понятной
 ошибкой, чтобы GUI можно было хотя бы открыть и посмотреть на Linux/mac
@@ -21,6 +21,7 @@ from pathlib import Path
 import psutil
 
 from core.strategies import Strategy
+from core.paths import ZAPRET_DIR
 
 WINWS_PROCESS_NAME = "winws.exe"
 
@@ -39,10 +40,18 @@ def _require_windows() -> None:
         )
 
 
+def _is_own_process(proc) -> bool:
+    try:
+        return ((proc.info.get("name") or "").lower() == WINWS_PROCESS_NAME
+                and Path(proc.exe()).resolve() == (ZAPRET_DIR / "bin" / "winws.exe").resolve())
+    except (psutil.Error, OSError):
+        return False
+
+
 def is_running() -> bool:
     for proc in psutil.process_iter(["name"]):
         try:
-            if (proc.info["name"] or "").lower() == WINWS_PROCESS_NAME:
+            if _is_own_process(proc):
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -53,7 +62,7 @@ def running_pids() -> list[int]:
     pids = []
     for proc in psutil.process_iter(["name", "pid"]):
         try:
-            if (proc.info["name"] or "").lower() == WINWS_PROCESS_NAME:
+            if _is_own_process(proc):
                 pids.append(proc.info["pid"])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -61,13 +70,13 @@ def running_pids() -> list[int]:
 
 
 def stop_all(timeout: float = 5.0) -> None:
-    """Останавливает все запущенные winws.exe (мягко, потом принудительно)."""
+    """Останавливает только winws.exe из нашей папки установки."""
     _require_windows()
 
     procs = []
     for proc in psutil.process_iter(["name"]):
         try:
-            if (proc.info["name"] or "").lower() == WINWS_PROCESS_NAME:
+            if _is_own_process(proc):
                 procs.append(proc)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -84,6 +93,11 @@ def stop_all(timeout: float = 5.0) -> None:
             proc.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
+
+
+    _, remaining = psutil.wait_procs(alive, timeout=timeout)
+    if remaining:
+        raise ProcessManagerError("Не удалось остановить свою копию winws.exe. Проверьте права администратора.")
 
 
 def start_strategy(strategy: Strategy, wait_seconds: float = 0.0) -> None:

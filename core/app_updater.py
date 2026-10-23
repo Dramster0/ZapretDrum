@@ -15,6 +15,10 @@ ZapretDrum-Setup.exe при каждом новом теге версии (см.
 from __future__ import annotations
 
 import os
+import json
+import hashlib
+import tempfile
+import time
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -22,12 +26,14 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import requests
+import psutil
 
 from core.app_version import get_app_version, is_newer
 from core.paths import (
     APPUPDATE_API_LATEST_RELEASE,
     APPUPDATE_API_ALL_RELEASES,
     DOWNLOAD_TMP_DIR,
+    APP_DATA_DIR,
     ensure_dirs,
 )
 
@@ -48,6 +54,8 @@ class AppReleaseInfo:
     setup_name: str
     notes: str
     published_at: str = ""
+    size: int = 0
+    digest: str = ""
 
 
 def _headers() -> dict:
@@ -103,6 +111,10 @@ def check_for_app_update() -> AppReleaseInfo | None:
         raise AppUpdateError(f"Не удалось проверить обновления ZapretDrum: {exc}") from exc
 
     data = resp.json()
+    tag_name = data.get("tag_name", "")
+    version = tag_name.lstrip("vV")
+    if not is_newer(version, get_app_version()):
+        return None
     assets = data.get("assets", [])
     setup_asset = next(
         (a for a in assets if a["name"].lower().endswith(".exe") and "setup" in a["name"].lower()),
@@ -111,13 +123,6 @@ def check_for_app_update() -> AppReleaseInfo | None:
     if setup_asset is None:
         raise AppUpdateError("В последнем релизе ZapretDrum не найден установщик (.exe).")
 
-    tag_name = data.get("tag_name", "")
-    version = tag_name.lstrip("vV")
-    current = get_app_version()
-
-    if not is_newer(version, current):
-        return None
-
     return AppReleaseInfo(
         tag_name=tag_name,
         version=version,
@@ -125,6 +130,8 @@ def check_for_app_update() -> AppReleaseInfo | None:
         setup_name=setup_asset["name"],
         notes=data.get("body", "") or "",
         published_at=data.get("published_at", "") or "",
+        size=int(setup_asset.get("size") or 0),
+        digest=setup_asset.get("digest") or "",
     )
 
 
@@ -139,7 +146,9 @@ def download_update_installer(
         raise AppUpdateError("Самообновление доступно только на Windows.")
 
     ensure_dirs()
-    setup_path = DOWNLOAD_TMP_DIR / release.setup_name
+    job_dir = Path(tempfile.mkdtemp(prefix="app-update-", dir=DOWNLOAD_TMP_DIR))
+    setup_path = job_dir / "ZapretDrum-Setup.exe"
+    partial = setup_path.with_suffix(".part")
 
     def report(msg: str, frac: float) -> None:
         if progress_cb:
@@ -151,47 +160,151 @@ def download_update_installer(
             resp.raise_for_status()
             total = int(resp.headers.get("content-length", 0)) or None
             written = 0
-            with open(setup_path, "wb") as f:
+            digest = hashlib.sha256()
+            with open(partial, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=1024 * 256):
                     if not chunk:
                         continue
                     f.write(chunk)
+                    digest.update(chunk)
                     written += len(chunk)
                     if total:
                         report("Скачиваю установщик...", min(written / total, 1.0))
-    except requests.RequestException as exc:
+            if not written or (release.size and written != release.size):
+                raise AppUpdateError("Установщик скачан не полностью. Повторите скачивание.")
+            if release.digest.startswith("sha256:") and digest.hexdigest() != release.digest[7:]:
+                raise AppUpdateError("Контрольная сумма установщика не совпадает с релизом.")
+            with partial.open("rb") as f:
+                if f.read(2) != b"MZ":
+                    raise AppUpdateError("Вместо установщика получен неподходящий файл.")
+            partial.replace(setup_path)
+    except (requests.RequestException, OSError) as exc:
         raise AppUpdateError(f"Не удалось скачать установщик: {exc}") from exc
+    finally:
+        partial.unlink(missing_ok=True)
 
     report("Установщик скачан. Подготавливаю обновление...", 1.0)
     return setup_path
 
 
-def launch_installer_after_app_exit(setup_path: Path) -> None:
+def launch_installer_after_app_exit(setup_path: Path, expected_version: str) -> None:
     """Запускает скрытый помощник, который дождётся закрытия приложения,
     а затем запустит установщик в тихом режиме."""
     if not IS_WINDOWS:
         raise AppUpdateError("Самообновление доступно только на Windows.")
 
-    helper_path = DOWNLOAD_TMP_DIR / "install_app_update.ps1"
-    installer_literal = "'" + str(setup_path).replace("'", "''") + "'"
-    script = (
-        "$ErrorActionPreference = 'Stop'\n"
-        f"$parentPid = {os.getpid()}\n"
-        f"$installerPath = {installer_literal}\n"
-        "while (Get-Process -Id $parentPid -ErrorAction SilentlyContinue) {\n"
-        "    Start-Sleep -Milliseconds 400\n"
-        "}\n"
-        "Start-Process -FilePath $installerPath -ArgumentList "
-        "@('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait\n"
+    target_dir = installed_app_directory()
+    helper_path = setup_path.parent / "install.ps1"
+    log_path = setup_path.parent / "installer.log"
+    def literal(value):
+        return "'" + str(value).replace("'", "''") + "'"
+
+    # PyInstaller onefile has a bootloader parent using the same executable.
+    processes = [psutil.Process(os.getpid())]
+    parent = processes[0].parent()
+    if parent and Path(parent.exe()).resolve() == Path(sys.executable).resolve():
+        processes.append(parent)
+    waits = "\n".join(
+        f"$p = Get-Process -Id {p.pid} -ErrorAction SilentlyContinue\n"
+        f"if ($p -and [Math]::Abs(($p.StartTime.ToUniversalTime() - "
+        f"$epoch).TotalSeconds - {p.create_time():.3f}) -lt 2) "
+        "{ if (-not $p.WaitForExit(120000)) { throw 'Приложение не завершилось за 2 минуты.' } }"
+        for p in processes
     )
+    script = f"""$ErrorActionPreference = 'Stop'
+$epoch = [DateTime]::SpecifyKind([DateTime]'1970-01-01', [DateTimeKind]::Utc)
+$statusPath = {literal(UPDATE_STATUS)}
+$status = @{{state='waiting'; version={literal(expected_version)}; log={literal(log_path)}; helper_pid=$PID; helper_started=0; message=''}}
+function Save-Status {{
+    $status | ConvertTo-Json | Set-Content -LiteralPath ($statusPath + '.tmp') -Encoding UTF8
+    Move-Item -LiteralPath ($statusPath + '.tmp') -Destination $statusPath -Force
+}}
+try {{
+    $status.helper_started = ((Get-Process -Id $PID).StartTime.ToUniversalTime() - $epoch).TotalSeconds
+    Save-Status
+    {waits}
+    $status.state = 'installing'
+    Save-Status
+    $installer = Start-Process -FilePath {literal(setup_path)} -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', {literal('/DIR="' + str(target_dir) + '"')}, {literal('/LOG="' + str(log_path) + '"')}) -WindowStyle Hidden -PassThru -Wait
+    if ($installer.ExitCode -ne 0) {{ throw ('Установщик завершился с кодом ' + $installer.ExitCode) }}
+    $status.state = 'installed'
+    Save-Status
+}} catch {{
+    $status.state = 'failed'
+    $status.message = $_.Exception.Message
+    Save-Status
+    exit 1
+}}
+"""
     try:
-        helper_path.write_text(script, encoding="utf-8")
-        subprocess.Popen(
+        helper_path.write_text(script, encoding="utf-8-sig")
+        UPDATE_STATUS.write_text(json.dumps({
+            "state": "waiting", "version": expected_version, "log": str(log_path),
+            "helper_pid": os.getpid(), "helper_started": psutil.Process().create_time(),
+        }), encoding="utf-8")
+        helper = subprocess.Popen(
             [
                 "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
                 "-WindowStyle", "Hidden", "-File", str(helper_path),
             ],
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        # Do not exit until the helper has acknowledged ownership of the job.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if helper.poll() is not None:
+                raise AppUpdateError(f"Помощник обновления завершился до начала установки (код {helper.returncode}).")
+            try:
+                status = json.loads(UPDATE_STATUS.read_text(encoding="utf-8-sig"))
+                if status.get("helper_pid") == helper.pid:
+                    return
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.1)
+        helper.terminate()
+        helper.wait(timeout=5)
+        raise AppUpdateError("Помощник обновления не ответил. Приложение останется открытым; повторите попытку.")
     except OSError as exc:
+        UPDATE_STATUS.unlink(missing_ok=True)
         raise AppUpdateError(f"Не удалось запустить установку обновления: {exc}") from exc
+
+
+UPDATE_STATUS = APP_DATA_DIR / "app_update.json"
+
+
+def installed_app_directory() -> Path:
+    directory = Path(sys.executable).resolve().parent
+    if not getattr(sys, "frozen", False) or not (directory / "unins000.exe").is_file():
+        raise AppUpdateError(
+            "Автообновление доступно для установленной версии ZapretDrum. "
+            "Установите приложение через ZapretDrum-Setup.exe и запустите его через ярлык."
+        )
+    return directory
+
+
+def startup_update_notice() -> tuple[bool, str] | None:
+    """Return (must_exit, message); keep the installation result until read."""
+    if not UPDATE_STATUS.exists():
+        return None
+    try:
+        status = json.loads(UPDATE_STATUS.read_text(encoding="utf-8-sig"))
+        if not isinstance(status, dict):
+            raise ValueError("Invalid update status")
+        if status.get("state") in ("waiting", "installing"):
+            try:
+                process = psutil.Process(int(status["helper_pid"]))
+                alive = abs(process.create_time() - float(status["helper_started"])) < 2
+            except (psutil.Error, KeyError, ValueError):
+                alive = False
+            if alive:
+                return True, "Обновление ZapretDrum ещё выполняется. Откройте приложение после завершения установки."
+        version = status.get("version", "?")
+        if status.get("state") == "installed" and get_app_version() == version:
+            message = f"ZapretDrum успешно обновлён до {version}."
+        else:
+            message = (f"Не удалось подтвердить обновление до {version}. Сейчас запущена версия {get_app_version()}.\n"
+                       + status.get("message", "") + "\nЖурнал установки: " + status.get("log", str(UPDATE_STATUS)))
+        UPDATE_STATUS.unlink()
+        return False, message
+    except (OSError, ValueError, TypeError):
+        return False, f"Не удалось прочитать результат обновления. Подробности: {UPDATE_STATUS}"

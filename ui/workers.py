@@ -12,6 +12,21 @@ from core.strategies import Strategy
 from core.tester import run_auto_test, StrategyTestResult
 
 
+class CallWorker(QThread):
+    finished_ok = pyqtSignal(object)
+    finished_error = pyqtSignal(str)
+
+    def __init__(self, function):
+        super().__init__()
+        self.function = function
+
+    def run(self):
+        try:
+            self.finished_ok.emit(self.function())
+        except Exception as exc:
+            self.finished_error.emit(str(exc))
+
+
 class InstallWorker(QThread):
     progress = pyqtSignal(str, float)
     finished_ok = pyqtSignal(object)   # ReleaseInfo

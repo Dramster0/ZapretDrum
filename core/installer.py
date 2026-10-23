@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import zipfile
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -47,6 +48,7 @@ class ReleaseInfo:
     zip_name: str
     published_at: str
     notes: str
+    warning: str = ""
 
 
 def _report(cb: ProgressCB, msg: str, frac: float) -> None:
@@ -147,6 +149,9 @@ def release_locks() -> None:
     except Exception:  # noqa: BLE001
         pass
     for name in _LOCKING_SERVICES:
+        from core.service_manager import service_belongs_to_install
+        if not service_belongs_to_install(name):
+            continue
         try:
             subprocess.run(
                 ["sc", "stop", name],
@@ -312,21 +317,26 @@ def _restore_user_lists() -> None:
 def _service_running() -> bool:
     try:
         from core import service_manager
-        return service_manager.get_service_status() == "running"
+        return (service_manager.service_belongs_to_install("zapret")
+                and service_manager.get_service_status() == "running")
     except Exception:  # noqa: BLE001
         return False
 
 
-def _start_service() -> None:
+def _start_service() -> bool:
     try:
-        subprocess.run(
+        from core.service_manager import service_belongs_to_install
+        if not service_belongs_to_install("zapret"):
+            return False
+        result = subprocess.run(
             ["sc", "start", "zapret"],
             capture_output=True,
             timeout=15,
             creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
         )
+        return result.returncode in (0, 1056)
     except Exception:  # noqa: BLE001
-        pass
+        return False
 
 
 def install_or_update(progress_cb: ProgressCB = None, release: ReleaseInfo | None = None) -> ReleaseInfo:
@@ -340,26 +350,32 @@ def install_or_update(progress_cb: ProgressCB = None, release: ReleaseInfo | Non
         _report(progress_cb, "Проверяю последнюю версию...", 0.02)
         release = fetch_latest_release()
 
-    zip_path = DOWNLOAD_TMP_DIR / release.zip_name
-    extract_dir = DOWNLOAD_TMP_DIR / "extracted"
-
-    if extract_dir.exists():
-        shutil.rmtree(extract_dir, ignore_errors=True)
-    extract_dir.mkdir(parents=True, exist_ok=True)
+    job_dir = Path(tempfile.mkdtemp(prefix="zapret-update-", dir=DOWNLOAD_TMP_DIR))
+    zip_path = job_dir / "release.zip"
+    extract_dir = job_dir / "extracted"
+    extract_dir.mkdir()
 
     _download_file(release.zip_url, zip_path, progress_cb)
-
-    _report(progress_cb, "Сохраняю ваши пользовательские списки доменов...", 0.75)
-    _backup_user_lists()
 
     _report(progress_cb, "Распаковываю архив...", 0.80)
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
+            for entry in zf.infolist():
+                if not (extract_dir / entry.filename).resolve().is_relative_to(extract_dir.resolve()):
+                    raise InstallerError("Архив содержит файл за пределами папки установки.")
             zf.extractall(extract_dir)
     except zipfile.BadZipFile as exc:
         raise InstallerError("Скачанный архив повреждён, попробуйте ещё раз.") from exc
 
     src_root = _find_extracted_root(extract_dir)
+    if not (src_root / "bin" / "winws.exe").is_file() or not (src_root / "service.bat").is_file():
+        raise InstallerError("В архиве нет обязательных файлов zapret. Старая установка сохранена.")
+    for relative in USER_LIST_NAMES:
+        source = ZAPRET_DIR / relative
+        if source.is_file():
+            target = src_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
 
     # Освобождаем файлы: останавливаем winws.exe, службу zapret и драйвер
     # WinDivert. Если этого не сделать, часть старых файлов остаётся занята.
@@ -367,33 +383,34 @@ def install_or_update(progress_cb: ProgressCB = None, release: ReleaseInfo | Non
     _report(progress_cb, "Останавливаю zapret перед обновлением...", 0.82)
     release_locks()
 
-    # ВАЖНО: НЕ используем shutil.move(src_root, ZAPRET_DIR) - если ZAPRET_DIR
-    # хоть частично уцелела (занятый драйвером bin/WinDivert64.sys, открытое
-    # в Проводнике окно и т.п.), такой вызов кладёт новую версию ВНУТРЬ неё
-    # как вложенную подпапку, и winws.exe пропадает с ожидаемого пути.
-    # Вместо этого очищаем что получится и вливаем содержимое новой версии.
+    # Directory renames are all-or-nothing. Do not merge versions or delete
+    # the old files until the new directory has taken its place.
     _report(progress_cb, "Устанавливаю новую версию...", 0.9)
-    ZAPRET_DIR.mkdir(parents=True, exist_ok=True)
-    _clear_dir_contents(ZAPRET_DIR)
-    failures: list[str] = []
-    _merge_move(src_root, ZAPRET_DIR, failures)
-
-    if not _winws_path().exists():
+    previous = job_dir / "previous"
+    try:
+        if ZAPRET_DIR.exists():
+            ZAPRET_DIR.rename(previous)
+        try:
+            src_root.rename(ZAPRET_DIR)
+        except OSError:
+            if previous.exists() and not ZAPRET_DIR.exists():
+                previous.rename(ZAPRET_DIR)
+            raise
+    except OSError as exc:
+        if service_was_running and _winws_path().exists():
+            _start_service()
         raise InstallerError(
-            "Не удалось установить zapret: файл bin\\winws.exe не появился на месте. "
-            "Скорее всего, старые файлы заняты драйвером WinDivert или антивирусом. "
-            "Перезагрузите компьютер и повторите установку."
-            + (f" Заняты: {', '.join(failures[:3])}" if failures else "")
-        )
-
-    _restore_user_lists()
+            "Не удалось заменить установку целиком. Новая версия не применена. "
+            f"Предыдущие файлы сохранены в {ZAPRET_DIR if ZAPRET_DIR.exists() else previous}. "
+            "Закройте использующие их программы и повторите обновление. " + str(exc)
+        ) from exc
 
     if service_was_running:
-        _start_service()
+        if not _start_service():
+            release.warning = "Файлы обновлены, но службу zapret запустить не удалось. Проверьте её состояние на главной странице."
 
     # уборка временных файлов
-    shutil.rmtree(extract_dir, ignore_errors=True)
-    zip_path.unlink(missing_ok=True)
+    shutil.rmtree(job_dir, ignore_errors=True)
 
     _report(progress_cb, "Готово", 1.0)
     return release

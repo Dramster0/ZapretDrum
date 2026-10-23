@@ -13,6 +13,7 @@ exe-файлом (не zip-архивом), поэтому логика знач
 from __future__ import annotations
 
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -157,21 +158,30 @@ def install_or_update(
         _report(progress_cb, "Проверяю последнюю версию tg-ws-proxy...", 0.02)
         release = fetch_latest_release()
 
+    job_dir = Path(tempfile.mkdtemp(prefix="telegram-update-", dir=DOWNLOAD_TMP_DIR))
+    tmp_path = job_dir / "proxy.exe"
+    _download_file(release.exe_url, tmp_path, progress_cb)
+    with tmp_path.open("rb") as downloaded:
+        if downloaded.read(2) != b"MZ":
+            raise TgInstallerError("Получен неподходящий файл tg-ws-proxy. Старая версия сохранена.")
     was_running = tg_manager.is_running()
     if was_running:
         _report(progress_cb, "Останавливаю tg-ws-proxy перед обновлением...", 0.05)
         tg_manager.stop()
 
-    tmp_path = DOWNLOAD_TMP_DIR / release.exe_name
-    _download_file(release.exe_url, tmp_path, progress_cb)
-
     _report(progress_cb, "Устанавливаю...", 0.95)
     TG_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(tmp_path), str(TG_EXE_PATH))
+    try:
+        tmp_path.replace(TG_EXE_PATH)
+    except OSError as exc:
+        if was_running:
+            tg_manager.start()
+        raise TgInstallerError("Не удалось заменить tg-ws-proxy. Старая версия сохранена. " + str(exc)) from exc
 
     if was_running:
         _report(progress_cb, "Запускаю tg-ws-proxy снова...", 0.98)
         tg_manager.start()
 
     _report(progress_cb, "Готово", 1.0)
+    shutil.rmtree(job_dir, ignore_errors=True)
     return release

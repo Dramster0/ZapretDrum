@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 
 
 def _relaunch_as_admin_windows() -> bool:
@@ -24,12 +25,13 @@ def _relaunch_as_admin_windows() -> bool:
     if is_admin:
         return False
 
-    params = " ".join(f'"{arg}"' for arg in sys.argv)
+    args = sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv
+    params = subprocess.list2cmdline(args)
     try:
-        ctypes.windll.shell32.ShellExecuteW(  # type: ignore[attr-defined]
+        result = ctypes.windll.shell32.ShellExecuteW(  # type: ignore[attr-defined]
             None, "runas", sys.executable, params, None, 1
         )
-        return True
+        return result > 32
     except Exception:
         # Пользователь отменил UAC-запрос или что-то пошло не так -
         # продолжаем без прав администратора (часть функций будет недоступна).
@@ -41,14 +43,16 @@ def main() -> None:
         if _relaunch_as_admin_windows():
             sys.exit(0)
 
-    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtWidgets import QApplication, QMessageBox
     from PyQt6.QtGui import QIcon
+    from PyQt6.QtCore import QTimer
     from ui.main_window import MainWindow
     from ui.theme import STYLESHEET
     from core.paths import resource_path
 
     app = QApplication(sys.argv)
     app.setApplicationName("ZapretDrum")
+    app.setQuitOnLastWindowClosed(False)
     # Стиль на уровне приложения, а не только окна - иначе диалоги
     # (QDialog для лога службы, выбора версии и т.д.) остаются в
     # системной светлой теме, т.к. это отдельные top-level окна.
@@ -58,8 +62,28 @@ def main() -> None:
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 
+    from ui.single_instance import SingleInstance
+    instance = SingleInstance(app)
+    if not instance.acquire():
+        if instance.error:
+            QMessageBox.information(None, "ZapretDrum", instance.error)
+        return
+
+    from core.app_updater import startup_update_notice
+    notice = startup_update_notice()
+    if notice and notice[0]:
+        # A new onefile process also locks the executable. Do not keep it
+        # alive indefinitely while the installer is replacing the app.
+        box = QMessageBox(QMessageBox.Icon.Information, "Обновление ZapretDrum", notice[1])
+        QTimer.singleShot(3000, box.accept)
+        box.exec()
+        return
+
     window = MainWindow()
+    instance.activated.connect(window._restore_from_tray)
     window.show()
+    if notice:
+        QMessageBox.information(window, "Результат обновления", notice[1])
 
     sys.exit(app.exec())
 

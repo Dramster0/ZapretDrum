@@ -76,27 +76,55 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}
 //     приложения в %LOCALAPPDATA%\ZapretDrum (эту папку создал не
 //     инсталлятор, а само приложение при первом запуске, поэтому
 //     Inno Setup не знает о ней и не удалит её сам).
+procedure RemoveOwnedService(Name, DataDir: String);
+var
+  ImagePath: String;
+  ResultCode: Integer;
+begin
+  if RegQueryStringValue(HKLM, 'SYSTEM\CurrentControlSet\Services\' + Name, 'ImagePath', ImagePath) then
+  begin
+    ImagePath := Lowercase(ImagePath);
+    if (Pos('"' + Lowercase(DataDir) + '\zapret\', ImagePath) = 1) or
+       (Pos(Lowercase(DataDir) + '\zapret\', ImagePath) = 1) or
+       (Pos('\??\' + Lowercase(DataDir) + '\zapret\', ImagePath) = 1) then
+    begin
+      Exec(ExpandConstant('{sys}\sc.exe'), 'stop ' + Name, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      Exec(ExpandConstant('{sys}\sc.exe'), 'delete ' + Name, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    end;
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;
   DataDir: String;
+  EscapedDir: String;
 begin
+  DataDir := ExpandConstant('{localappdata}\ZapretDrum');
   if CurUninstallStep = usUninstall then
   begin
-    Exec('cmd.exe', '/c net stop zapret & sc delete zapret & net stop WinDivert & sc delete WinDivert & net stop WinDivert14 & sc delete WinDivert14',
+    RemoveOwnedService('zapret', DataDir);
+    RemoveOwnedService('WinDivert', DataDir);
+    RemoveOwnedService('WinDivert14', DataDir);
+    EscapedDir := DataDir;
+    StringChangeEx(EscapedDir, '''', '''''', True);
+    Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -WindowStyle Hidden -Command "Get-Process -Name winws,TgWsProxy_windows -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq ''' + EscapedDir + '\zapret\bin\winws.exe'' -or $_.Path -eq ''' + EscapedDir + '\tg-ws-proxy\TgWsProxy_windows.exe'' } | Stop-Process -Force"',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM winws.exe /F', '',
-      SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 
   if CurUninstallStep = usPostUninstall then
   begin
-    DataDir := ExpandConstant('{localappdata}\ZapretDrum');
     if DirExists(DataDir) then
     begin
-      if MsgBox('Также удалить скачанный zapret и настройки приложения?' + #13#10 + DataDir,
+      if MsgBox('Также удалить скачанные zapret, tg-ws-proxy и их настройки?' + #13#10 + DataDir,
         mbConfirmation, MB_YESNO) = IDYES then
-        DelTree(DataDir, True, True, True);
+      begin
+        DeleteFile(ExpandConstant('{userstartup}\ZapretDrum-TgWsProxy.lnk'));
+        DeleteFile(ExpandConstant('{userstartup}\ZapretDrum-TgWsProxy.vbs'));
+        if not DelTree(DataDir, True, True, True) then
+          MsgBox('Часть файлов ещё занята. После перезагрузки их можно удалить из папки:' + #13#10 + DataDir, mbInformation, MB_OK);
+      end;
     end;
   end;
 end;
