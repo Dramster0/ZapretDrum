@@ -159,7 +159,7 @@ class CheckAppUpdateWorker(QThread):
 
 class DownloadAppUpdateWorker(QThread):
     progress = pyqtSignal(str, float)
-    finished_ok = pyqtSignal()
+    finished_ok = pyqtSignal(str)  # путь к скачанному установщику
     finished_error = pyqtSignal(str)
 
     def __init__(self, release):
@@ -168,11 +168,11 @@ class DownloadAppUpdateWorker(QThread):
 
     def run(self) -> None:
         try:
-            app_updater.download_and_launch_update(
+            setup_path = app_updater.download_update_installer(
                 self.release,
                 progress_cb=lambda msg, frac: self.progress.emit(msg, frac),
             )
-            self.finished_ok.emit()
+            self.finished_ok.emit(str(setup_path))
         except app_updater.AppUpdateError as exc:
             self.finished_error.emit(str(exc))
         except Exception as exc:  # noqa: BLE001

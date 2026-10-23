@@ -9,16 +9,16 @@ ZapretDrum-Setup.exe при каждом новом теге версии (см.
 и если версия новее текущей - предлагает скачать и поставить обновление
 одной кнопкой, без похода в браузер.
 
-Технически: скачанный Setup.exe запускается в тихом режиме
-(/VERYSILENT), после чего наше же приложение закрывает само себя - тогда
-инсталлятор может спокойно перезаписать файлы и (см. флаг в setup.iss)
-сам перезапустить обновлённую версию.
+Технически: скачивается Setup.exe, затем отдельный помощник дожидается
+закрытия приложения и запускает установщик в тихом режиме (/VERYSILENT).
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 import requests
@@ -128,11 +128,12 @@ def check_for_app_update() -> AppReleaseInfo | None:
     )
 
 
-def download_and_launch_update(release: AppReleaseInfo, progress_cb: ProgressCB = None) -> None:
+def download_update_installer(
+    release: AppReleaseInfo, progress_cb: ProgressCB = None
+) -> Path:
     """
-    Скачивает установщик и запускает его в тихом режиме. Само приложение
-    нужно закрыть сразу после вызова этой функции (см. AppUpdatePage) -
-    иначе инсталлятор не сможет перезаписать запущенный .exe.
+    Скачивает установщик обновления. Запуск откладывается до закрытия
+    приложения, чтобы установщик не пытался заменить работающий .exe.
     """
     if not IS_WINDOWS:
         raise AppUpdateError("Самообновление доступно только на Windows.")
@@ -161,9 +162,36 @@ def download_and_launch_update(release: AppReleaseInfo, progress_cb: ProgressCB 
     except requests.RequestException as exc:
         raise AppUpdateError(f"Не удалось скачать установщик: {exc}") from exc
 
-    report("Запускаю установку...", 1.0)
-    # /VERYSILENT - без окон и вопросов; /NORESTART - не перезагружать Windows;
-    # /SUPPRESSMSGBOXES - не показывать итоговые сообщения.
-    subprocess.Popen(
-        [str(setup_path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
+    report("Установщик скачан. Подготавливаю обновление...", 1.0)
+    return setup_path
+
+
+def launch_installer_after_app_exit(setup_path: Path) -> None:
+    """Запускает скрытый помощник, который дождётся закрытия приложения,
+    а затем запустит установщик в тихом режиме."""
+    if not IS_WINDOWS:
+        raise AppUpdateError("Самообновление доступно только на Windows.")
+
+    helper_path = DOWNLOAD_TMP_DIR / "install_app_update.ps1"
+    installer_literal = "'" + str(setup_path).replace("'", "''") + "'"
+    script = (
+        "$ErrorActionPreference = 'Stop'\n"
+        f"$parentPid = {os.getpid()}\n"
+        f"$installerPath = {installer_literal}\n"
+        "while (Get-Process -Id $parentPid -ErrorAction SilentlyContinue) {\n"
+        "    Start-Sleep -Milliseconds 400\n"
+        "}\n"
+        "Start-Process -FilePath $installerPath -ArgumentList "
+        "@('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait\n"
     )
+    try:
+        helper_path.write_text(script, encoding="utf-8")
+        subprocess.Popen(
+            [
+                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-WindowStyle", "Hidden", "-File", str(helper_path),
+            ],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as exc:
+        raise AppUpdateError(f"Не удалось запустить установку обновления: {exc}") from exc

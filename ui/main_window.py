@@ -1762,20 +1762,22 @@ class SettingsPage(QWidget):
         self.app_update_status_label.setText(msg)
         self.app_update_progress.setValue(int(frac * 100))
 
-    def _on_app_update_downloaded(self) -> None:
-        # Установщик уже запущен в тихом режиме - предупреждаем пользователя
-        # и закрываемся, чтобы он мог перезаписать файлы. Инсталлятор
-        # больше НЕ пытается перезапустить приложение сам: если запуск в
-        # этот момент упадёт из-за антивируса/SmartScreen, каждая неудачная
-        # попытка показывала бы своё собственное пугающее системное окно
-        # ошибки - надёжнее один раз честно попросить открыть вручную.
+    def _on_app_update_downloaded(self, setup_path: str) -> None:
         QMessageBox.information(
             self,
             "Установка обновления",
-            "ZapretDrum сейчас закроется, установка продолжится в фоне "
-            "(обычно занимает несколько секунд). После этого откройте "
-            "ZapretDrum снова через ярлык или меню Пуск.",
+            "Установщик скачан. ZapretDrum закроется, затем установка "
+            "автоматически начнётся в фоне. Подождите несколько секунд и "
+            "откройте приложение снова через ярлык или меню Пуск.",
         )
+        try:
+            app_updater.launch_installer_after_app_exit(Path(setup_path))
+        except app_updater.AppUpdateError as exc:
+            self.check_app_update_btn.setEnabled(True)
+            self.install_app_update_btn.setEnabled(True)
+            self.main_window.set_busy(False)
+            QMessageBox.warning(self, "Не удалось запустить установку", str(exc))
+            return
         QApplication.instance().quit()
 
     def _reinstall(self) -> None:
