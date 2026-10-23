@@ -20,6 +20,13 @@ STYLESHEET = f"""
     color: {TEXT_PRIMARY};
 }}
 
+QToolTip {{
+    background-color: {BG_ELEVATED};
+    color: {TEXT_PRIMARY};
+    border: 1px solid {BORDER};
+    padding: 6px 8px;
+}}
+
 QMainWindow, QWidget#root {{
     background-color: {BG};
     border-radius: 12px;

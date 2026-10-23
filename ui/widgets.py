@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 
-from PyQt6.QtCore import Qt, pyqtSignal, QRectF
+from PyQt6.QtCore import Qt, pyqtSignal, QRectF, QPoint
 from PyQt6.QtGui import QColor, QPainter, QFont, QPen
 from PyQt6.QtWidgets import (
+    QApplication,
     QWidget,
     QLabel,
     QHBoxLayout,
@@ -269,6 +270,7 @@ class MainTitleBar(QWidget):
         self.setObjectName("titleBar")
         self.setFixedHeight(40)
         self._drag_pos = None
+        self._maximized_drag_anchor_y = None
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(14, 0, 0, 0)
@@ -311,18 +313,47 @@ class MainTitleBar(QWidget):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.window_ref.frameGeometry().topLeft()
+            press_pos = event.globalPosition().toPoint()
+            self._drag_pos = press_pos - self.window_ref.frameGeometry().topLeft()
+            self._maximized_drag_anchor_y = (
+                press_pos.y() if self.window_ref.is_custom_maximized else None
+            )
             event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         if self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            global_pos = event.globalPosition().toPoint()
             if self.window_ref.is_custom_maximized:
+                anchor_y = self._maximized_drag_anchor_y
+                if (
+                    anchor_y is not None
+                    and global_pos.y() - anchor_y >= QApplication.startDragDistance()
+                ):
+                    maximized_width = max(1, self.window_ref.width())
+                    screen = QApplication.screenAt(global_pos) or self.window_ref.screen()
+                    screen_left = screen.availableGeometry().left() if screen else 0
+                    x_ratio = min(
+                        1.0,
+                        max(0.0, (global_pos.x() - screen_left) / maximized_width),
+                    )
+                    self.window_ref.toggle_maximize()
+                    self._drag_pos = QPoint(
+                        int(self.window_ref.width() * x_ratio),
+                        min(20, self.window_ref.height() // 2),
+                    )
+                    self.window_ref.move(global_pos - self._drag_pos)
+                    self._maximized_drag_anchor_y = None
                 return
-            self.window_ref.move(event.globalPosition().toPoint() - self._drag_pos)
+            self.window_ref.move(global_pos - self._drag_pos)
+            screen = QApplication.screenAt(global_pos)
+            if screen and global_pos.y() <= screen.availableGeometry().top():
+                self.window_ref.toggle_maximize()
+                self._maximized_drag_anchor_y = global_pos.y()
             event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         self._drag_pos = None
+        self._maximized_drag_anchor_y = None
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:

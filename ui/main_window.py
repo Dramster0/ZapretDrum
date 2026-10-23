@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, QUrl
-from PyQt6.QtGui import QIcon, QDesktopServices
+from PyQt6.QtGui import QAction, QIcon, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -20,9 +20,11 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QProgressBar,
     QMessageBox,
+    QMenu,
     QDialog,
     QDialogButtonBox,
     QTextEdit,
+    QSystemTrayIcon,
 )
 
 from core import process_manager
@@ -47,7 +49,7 @@ from core.state import load_state, save_state
 from core.strategies import discover_strategies, Strategy, find_strategy
 from core.updater import check_for_updates, UpdateCheckResult
 
-from ui.theme import STYLESHEET, TEXT_SECONDARY, SUCCESS, DANGER, BORDER, ACCENT
+from ui.theme import STYLESHEET, TEXT_PRIMARY, TEXT_SECONDARY, BG_ELEVATED, SUCCESS, DANGER, BORDER, ACCENT
 from ui.widgets import Card, StrategyRow, PowerButton, StatusDot, make_avatar, nav_button, MainTitleBar, DialogTitleBar, ResizeGrip
 from ui.workers import (
     InstallWorker,
@@ -61,7 +63,6 @@ from ui.workers import (
     DownloadAppUpdateWorker,
     FetchChangelogWorker,
     TgInstallWorker,
-    TgFetchReleasesWorker,
     TgStartWorker,
     TgStopWorker,
 )
@@ -424,12 +425,20 @@ class HomePage(QWidget):
         list_title.setStyleSheet("font-size: 16px; font-weight: 700;")
         header_row.addWidget(list_title)
         header_row.addStretch(1)
-        refresh_btn = QPushButton("🔄")
-        refresh_btn.setObjectName("secondaryButton")
-        refresh_btn.setFixedWidth(40)
-        refresh_btn.setToolTip("Обновить список стратегий")
-        refresh_btn.clicked.connect(self.reload_strategies)
-        header_row.addWidget(refresh_btn)
+        self.refresh_btn = QPushButton("Обновить")
+        self.refresh_btn.setObjectName("secondaryButton")
+        self.refresh_btn.setFixedWidth(130)
+        self.refresh_btn.setToolTip(
+            "Повторно просканировать папку zapret и обновить список .bat-стратегий. "
+            "Полезно после ручного добавления или удаления файлов стратегий."
+        )
+        self.refresh_btn.clicked.connect(self._on_refresh_clicked)
+        header_row.addWidget(self.refresh_btn)
+        self.refresh_feedback_timer = QTimer(self)
+        self.refresh_feedback_timer.setSingleShot(True)
+        self.refresh_feedback_timer.timeout.connect(
+            lambda: self.refresh_btn.setText("Обновить")
+        )
         left_card.body.addLayout(header_row)
 
         scroll = QScrollArea()
@@ -545,6 +554,12 @@ class HomePage(QWidget):
         content_row.addWidget(right_container, 2)
 
     # ------------------------------------------------------------------ #
+    def _on_refresh_clicked(self) -> None:
+        self.reload_strategies()
+        count = len(self.rows)
+        self.refresh_btn.setText(f"Найдено: {count}")
+        self.refresh_feedback_timer.start(2200)
+
     def reload_strategies(self) -> None:
         for i in reversed(range(self.list_layout.count() - 1)):
             item = self.list_layout.itemAt(i)
@@ -1363,9 +1378,6 @@ class UpdatePage(QWidget):
         self.main_window = main_window
         self.install_worker: InstallWorker | None = None
         self.fetch_releases_worker: FetchReleasesWorker | None = None
-        self.tg_install_worker: TgInstallWorker | None = None
-        self.tg_fetch_releases_worker: TgFetchReleasesWorker | None = None
-
         root = QVBoxLayout(self)
         root.setContentsMargins(32, 28, 32, 28)
         root.setSpacing(16)
@@ -1426,59 +1438,7 @@ class UpdatePage(QWidget):
         note.setStyleSheet(f"color: {TEXT_SECONDARY};")
         root.addWidget(note)
 
-        # --- блок 2: tg-ws-proxy (отдельная программа, отдельное обновление) --- #
-        tg_heading = QLabel("Обновление tg-ws-proxy")
-        tg_heading.setObjectName("pageSubtitle")
-        tg_heading.setStyleSheet("font-weight: 600; font-size: 15px;")
-        root.addWidget(tg_heading)
-
-        tg_subtitle = QLabel(f"Источник: {TG_GITHUB_RELEASES_PAGE}")
-        tg_subtitle.setObjectName("pageSubtitle")
-        root.addWidget(tg_subtitle)
-
-        tg_card = Card()
-        self.tg_installed_label = QLabel("Установленная версия: —")
-        self.tg_latest_label = QLabel("Последняя версия: —")
-        tg_card.body.addWidget(self.tg_installed_label)
-        tg_card.body.addWidget(self.tg_latest_label)
-
-        self.tg_progress_bar = QProgressBar()
-        self.tg_progress_bar.setRange(0, 100)
-        self.tg_progress_bar.setVisible(False)
-        tg_card.body.addWidget(self.tg_progress_bar)
-
-        self.tg_progress_label = QLabel("")
-        self.tg_progress_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
-        self.tg_progress_label.setVisible(False)
-        tg_card.body.addWidget(self.tg_progress_label)
-
-        tg_btn_row = QHBoxLayout()
-        self.tg_check_button = QPushButton("Проверить обновления")
-        self.tg_check_button.setObjectName("secondaryButton")
-        self.tg_check_button.clicked.connect(self.check_tg_updates)
-        self.tg_update_button = QPushButton("Скачать и установить одной кнопкой")
-        self.tg_update_button.setObjectName("primaryButton")
-        self.tg_update_button.clicked.connect(lambda: self.run_tg_update(None))
-        tg_btn_row.addWidget(self.tg_check_button)
-        tg_btn_row.addWidget(self.tg_update_button)
-        tg_btn_row.addStretch(1)
-        tg_card.body.addLayout(tg_btn_row)
-        root.addWidget(tg_card)
-
-        tg_note = QLabel(
-            "tg-ws-proxy - отдельная программа (локальный MTProto-прокси для "
-            "ускорения Telegram). Обновление затрагивает только сам exe-файл: "
-            "ваши настройки и секрет прокси не трогаются. Запуском, "
-            "остановкой и автозапуском tg-ws-proxy управляйте на вкладке "
-            "«Telegram»."
-        )
-        tg_note.setWordWrap(True)
-        tg_note.setStyleSheet(f"color: {TEXT_SECONDARY};")
-        root.addWidget(tg_note)
-
         root.addStretch(1)
-
-        self._refresh_tg_labels()
 
     def check_updates(self) -> None:
         self.check_button.setEnabled(False)
@@ -1620,84 +1580,6 @@ class UpdatePage(QWidget):
         self.progress_label.setText("Ошибка")
         self.main_window.set_busy(False)
         QMessageBox.warning(self, "Ошибка обновления", message)
-
-    # ------------------------------------------------------------------ #
-    # tg-ws-proxy
-    # ------------------------------------------------------------------ #
-    def _refresh_tg_labels(self) -> None:
-        state = load_state()
-        installed = state.tg_installed_version
-        if installed:
-            self.tg_installed_label.setText(f"Установленная версия: {installed}")
-        elif tg_manager.is_installed():
-            self.tg_installed_label.setText("Установленная версия: неизвестна")
-        else:
-            self.tg_installed_label.setText("Установленная версия: не установлена")
-
-    def check_tg_updates(self) -> None:
-        self.tg_check_button.setEnabled(False)
-        self.main_window.set_busy(True, "Проверяю обновления tg-ws-proxy...")
-        QTimer.singleShot(50, self._do_check_tg)
-
-    def _do_check_tg(self) -> None:
-        self.tg_check_button.setEnabled(True)
-        self.main_window.set_busy(False)
-        self._refresh_tg_labels()
-
-        try:
-            latest = tg_installer.fetch_latest_release()
-        except tg_installer.TgInstallerError as exc:
-            self.tg_latest_label.setText(f"Не удалось проверить: {exc}")
-            return
-
-        self.tg_latest_label.setText(f"Последняя версия: {latest.tag_name}")
-        installed = load_state().tg_installed_version
-        if installed != latest.tag_name:
-            self.tg_update_button.setText(f"Обновить до {latest.tag_name}")
-        else:
-            self.tg_update_button.setText("У вас последняя версия (переустановить)")
-
-    def run_tg_update(self, release) -> None:
-        self.tg_update_button.setEnabled(False)
-        self.tg_check_button.setEnabled(False)
-        self.tg_progress_bar.setVisible(True)
-        self.tg_progress_label.setVisible(True)
-        self.tg_progress_bar.setValue(0)
-        label = release.tag_name if release else "последнюю версию"
-        self.main_window.set_busy(True, f"Устанавливаю tg-ws-proxy {label}...")
-
-        self.tg_install_worker = TgInstallWorker(release)
-        self.tg_install_worker.progress.connect(self._on_tg_progress)
-        self.tg_install_worker.finished_ok.connect(self._on_tg_finished)
-        self.tg_install_worker.finished_error.connect(self._on_tg_error)
-        self.tg_install_worker.start()
-
-    def _on_tg_progress(self, msg: str, frac: float) -> None:
-        self.tg_progress_label.setText(msg)
-        self.tg_progress_bar.setValue(int(frac * 100))
-
-    def _on_tg_finished(self, release) -> None:
-        state = load_state()
-        state.tg_installed_version = release.tag_name
-        save_state(state)
-
-        self.tg_update_button.setEnabled(True)
-        self.tg_check_button.setEnabled(True)
-        self.tg_installed_label.setText(f"Установленная версия: {release.tag_name}")
-        self.tg_latest_label.setText(f"Последняя версия: {release.tag_name}")
-        self.tg_update_button.setText("У вас последняя версия (переустановить)")
-        self.main_window.set_busy(False)
-        if hasattr(self.main_window, "telegram_page"):
-            self.main_window.telegram_page.refresh()
-        QMessageBox.information(self, "Готово", f"tg-ws-proxy установлен, версия {release.tag_name}.")
-
-    def _on_tg_error(self, message: str) -> None:
-        self.tg_update_button.setEnabled(True)
-        self.tg_check_button.setEnabled(True)
-        self.tg_progress_label.setText("Ошибка")
-        self.main_window.set_busy(False)
-        QMessageBox.warning(self, "Ошибка обновления tg-ws-proxy", message)
-
 
 # --------------------------------------------------------------------------- #
 # Настройки
@@ -2201,6 +2083,26 @@ class MainWindow(QMainWindow):
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 
+        self.tray_icon = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray_icon.setToolTip("ZapretDrum")
+        tray_menu = QMenu(self)
+        tray_menu.setStyleSheet(
+            f"QMenu {{ background-color: {BG_ELEVATED}; color: {TEXT_PRIMARY}; "
+            f"border: 1px solid {BORDER}; padding: 4px; }}"
+            f"QMenu::item {{ color: {TEXT_PRIMARY}; padding: 6px 24px; }}"
+            f"QMenu::item:selected {{ background-color: {ACCENT}; color: white; }}"
+        )
+        open_action = QAction("Открыть ZapretDrum", self)
+        open_action.triggered.connect(self._restore_from_tray)
+        exit_action = QAction("Выход", self)
+        exit_action.triggered.connect(QApplication.quit)
+        tray_menu.addAction(open_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(exit_action)
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
         # Убираем системную рамку - свой заголовок рисуем сами (MainTitleBar).
         # Перетаскивание - вручную мышью за заголовок; изменение размера -
         # через уголок ResizeGrip в углу. Оба варианта - чистый Qt, без
@@ -2472,6 +2374,29 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ #
     # ------------------------------------------------------------------ #
+    def closeEvent(self, event) -> None:
+        """Закрытие окна скрывает приложение в трей; выход доступен из меню трея."""
+        if self.tray_icon.isVisible():
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "ZapretDrum",
+                "Приложение продолжает работать в системном трее.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2500,
+            )
+            return
+        super().closeEvent(event)
+
+    def _restore_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._restore_from_tray()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if hasattr(self, "resize_grip"):
