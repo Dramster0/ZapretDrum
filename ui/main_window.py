@@ -2159,6 +2159,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.operations = Operations(self)
         self._exit_requested = False
+        self._exit_started = False
         self._exit_action = None
         self.setWindowTitle("ZapretDrum — обход блокировок Discord/YouTube")
         self.resize(1120, 680)
@@ -2433,7 +2434,7 @@ class MainWindow(QMainWindow):
             self._refresh_status()
 
     def request_exit(self, checked=False, after_exit=None) -> None:
-        if self.has_modal_dialog():
+        if self.has_modal_dialog() or self._exit_requested:
             return
         self._exit_requested = True
         self._exit_action = after_exit
@@ -2445,12 +2446,15 @@ class MainWindow(QMainWindow):
         self.finish_pending_exit()
 
     def finish_pending_exit(self) -> None:
-        if not self._exit_requested or self.operations.active or self.operations.workers:
+        if (not self._exit_requested or self._exit_started
+                or self.operations.active or self.operations.workers):
             return
+        self._exit_started = True
         if self._exit_action:
             try:
                 self._exit_action()
             except Exception as exc:
+                self._exit_started = False
                 self._exit_requested = False
                 self._exit_action = None
                 self.settings_page.check_app_update_btn.setEnabled(True)
@@ -2458,9 +2462,13 @@ class MainWindow(QMainWindow):
                     self.settings_page._pending_app_release is not None)
                 QMessageBox.warning(self, "Не удалось завершить действие", str(exc))
                 return
+        self._exit_action = None
+        self.operations.after_finish = None
+        self.operations.timer.stop()
         self.status_timer.stop()
         self.tray_icon.hide()
-        # Explicit exit bypasses the close-to-tray handler. Workers are done.
+        self.close()
+        # Workers are done. Exit the event loop even with quit-on-close disabled.
         QApplication.instance().exit(0)
 
     @exclusive_action
@@ -2537,6 +2545,9 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def closeEvent(self, event) -> None:
         """Закрытие окна скрывает приложение в трей; выход доступен из меню трея."""
+        if self._exit_started:
+            event.accept()
+            return
         if self.tray_icon.isVisible() and QSystemTrayIcon.isSystemTrayAvailable():
             event.ignore()
             self.hide()

@@ -42,3 +42,8 @@ class SingleInstance(QObject):
             socket.close()
             socket.deleteLater()
         self.activated.emit()
+
+    def release(self) -> None:
+        """Release IPC resources explicitly, before Python/Qt teardown."""
+        self.server.close()
+        self.lock.unlock()

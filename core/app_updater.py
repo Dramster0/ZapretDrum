@@ -196,6 +196,8 @@ def launch_installer_after_app_exit(setup_path: Path, expected_version: str) -> 
     target_dir = installed_app_directory()
     helper_path = setup_path.parent / "install.ps1"
     log_path = setup_path.parent / "installer.log"
+    helper_log = setup_path.parent / "update-helper.log"
+    exit_ready = setup_path.parent / "exit.ready"
     def literal(value):
         return "'" + str(value).replace("'", "''") + "'"
 
@@ -205,41 +207,88 @@ def launch_installer_after_app_exit(setup_path: Path, expected_version: str) -> 
     if parent and Path(parent.exe()).resolve() == Path(sys.executable).resolve():
         processes.append(parent)
     waits = "\n".join(
-        f"$p = Get-Process -Id {p.pid} -ErrorAction SilentlyContinue\n"
-        f"if ($p -and [Math]::Abs(($p.StartTime.ToUniversalTime() - "
-        f"$epoch).TotalSeconds - {p.create_time():.3f}) -lt 2) "
-        "{ if (-not $p.WaitForExit(120000)) { throw 'Приложение не завершилось за 2 минуты.' } }"
+        f"Wait-AppProcess -ProcessId {p.pid} -Started {p.create_time():.3f} "
+        f"-ExpectedPath {literal(Path(p.exe()).resolve())}"
         for p in processes
     )
     script = f"""$ErrorActionPreference = 'Stop'
 $epoch = [DateTime]::SpecifyKind([DateTime]'1970-01-01', [DateTimeKind]::Utc)
 $statusPath = {literal(UPDATE_STATUS)}
-$status = @{{state='waiting'; version={literal(expected_version)}; log={literal(log_path)}; helper_pid=$PID; helper_started=0; message=''}}
+$helperLog = {literal(helper_log)}
+$exitReady = {literal(exit_ready)}
+$status = @{{state='waiting'; version={literal(expected_version)}; log={literal(log_path)}; helper_log=$helperLog; helper_pid=$PID; helper_started=0; forced_pids=@(); message=''}}
+function Write-HelperLog([string]$Message) {{
+    Add-Content -LiteralPath $helperLog -Value ((Get-Date -Format o) + ' ' + $Message) -Encoding UTF8
+}}
 function Save-Status {{
     $status | ConvertTo-Json | Set-Content -LiteralPath ($statusPath + '.tmp') -Encoding UTF8
     Move-Item -LiteralPath ($statusPath + '.tmp') -Destination $statusPath -Force
 }}
+function Wait-AppProcess([int]$ProcessId, [double]$Started, [string]$ExpectedPath) {{
+    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if (-not $process) {{ return }}
+    try {{
+        # Keep a handle to this instance; never kill by executable name or PID alone.
+        $null = $process.Handle
+        if ($process.HasExited) {{ return }}
+        $actualStarted = ($process.StartTime.ToUniversalTime() - $epoch).TotalSeconds
+        if ([Math]::Abs($actualStarted - $Started) -ge 2) {{ return }}
+        if (-not [string]::Equals($process.Path, $ExpectedPath, [StringComparison]::OrdinalIgnoreCase)) {{
+            throw ('Не удалось подтвердить путь процесса ' + $ProcessId)
+        }}
+        Write-HelperLog ('Waiting for ZapretDrum PID ' + $ProcessId)
+        if (-not $process.WaitForExit(30000)) {{
+            Write-HelperLog ('Shutdown timed out; terminating verified PID ' + $ProcessId)
+            $process.Kill()
+            if (-not $process.WaitForExit(10000)) {{
+                throw ('Не удалось завершить ZapretDrum, PID ' + $ProcessId)
+            }}
+            $status.forced_pids += $ProcessId
+            Save-Status
+        }}
+        Write-HelperLog ('ZapretDrum PID ' + $ProcessId + ' exited')
+    }} catch {{
+        # The app may have exited between Get-Process and opening its handle.
+        if (-not $process.HasExited) {{ throw }}
+    }} finally {{
+        $process.Dispose()
+    }}
+}}
 try {{
     $status.helper_started = ((Get-Process -Id $PID).StartTime.ToUniversalTime() - $epoch).TotalSeconds
+    Write-HelperLog 'Update helper started'
     Save-Status
+    # Do not terminate the app unless it has acknowledged the helper and
+    # committed to exit, after all managed operations have finished.
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while (-not (Test-Path -LiteralPath $exitReady)) {{
+        if ([DateTime]::UtcNow -ge $deadline) {{ throw 'Приложение не подтвердило выход для обновления.' }}
+        Start-Sleep -Milliseconds 100
+    }}
+    Write-HelperLog 'App committed to exit'
     {waits}
     $status.state = 'installing'
     Save-Status
+    Write-HelperLog 'Starting installer'
     $installer = Start-Process -FilePath {literal(setup_path)} -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', {literal('/DIR="' + str(target_dir) + '"')}, {literal('/LOG="' + str(log_path) + '"')}) -WindowStyle Hidden -PassThru -Wait
     if ($installer.ExitCode -ne 0) {{ throw ('Установщик завершился с кодом ' + $installer.ExitCode) }}
     $status.state = 'installed'
     Save-Status
+    Write-HelperLog 'Installation completed'
 }} catch {{
     $status.state = 'failed'
     $status.message = $_.Exception.Message
     Save-Status
+    Write-HelperLog $status.message
     exit 1
 }}
 """
     try:
+        exit_ready.unlink(missing_ok=True)
         helper_path.write_text(script, encoding="utf-8-sig")
         UPDATE_STATUS.write_text(json.dumps({
             "state": "waiting", "version": expected_version, "log": str(log_path),
+            "helper_log": str(helper_log),
             "helper_pid": os.getpid(), "helper_started": psutil.Process().create_time(),
         }), encoding="utf-8")
         helper = subprocess.Popen(
@@ -248,6 +297,11 @@ try {{
                 "-WindowStyle", "Hidden", "-File", str(helper_path),
             ],
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            cwd=str(setup_path.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
         )
         # Do not exit until the helper has acknowledged ownership of the job.
         deadline = time.monotonic() + 10
@@ -256,10 +310,13 @@ try {{
                 raise AppUpdateError(f"Помощник обновления завершился до начала установки (код {helper.returncode}).")
             try:
                 status = json.loads(UPDATE_STATUS.read_text(encoding="utf-8-sig"))
-                if status.get("helper_pid") == helper.pid:
-                    return
+                ready = (status.get("helper_pid") == helper.pid
+                         and status.get("state") == "waiting")
             except (OSError, ValueError):
-                pass
+                ready = False
+            if ready:
+                exit_ready.write_text("exit requested\n", encoding="ascii")
+                return
             time.sleep(0.1)
         helper.terminate()
         helper.wait(timeout=5)
@@ -304,6 +361,8 @@ def startup_update_notice() -> tuple[bool, str] | None:
         else:
             message = (f"Не удалось подтвердить обновление до {version}. Сейчас запущена версия {get_app_version()}.\n"
                        + status.get("message", "") + "\nЖурнал установки: " + status.get("log", str(UPDATE_STATUS)))
+            if status.get("helper_log"):
+                message += "\nЖурнал обновления: " + str(status["helper_log"])
         UPDATE_STATUS.unlink()
         return False, message
     except (OSError, ValueError, TypeError):

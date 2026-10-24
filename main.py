@@ -69,23 +69,26 @@ def main() -> None:
             QMessageBox.information(None, "ZapretDrum", instance.error)
         return
 
-    from core.app_updater import startup_update_notice
-    notice = startup_update_notice()
-    if notice and notice[0]:
-        # A new onefile process also locks the executable. Do not keep it
-        # alive indefinitely while the installer is replacing the app.
-        box = QMessageBox(QMessageBox.Icon.Information, "Обновление ZapretDrum", notice[1])
-        QTimer.singleShot(3000, box.accept)
-        box.exec()
-        return
+    try:
+        from core.app_updater import startup_update_notice
+        notice = startup_update_notice()
+        if notice and notice[0]:
+            # A new onefile process also locks the executable. Do not keep it
+            # alive indefinitely while the installer is replacing the app.
+            box = QMessageBox(QMessageBox.Icon.Information, "Обновление ZapretDrum", notice[1])
+            QTimer.singleShot(3000, box.accept)
+            box.exec()
+            return
 
-    window = MainWindow()
-    instance.activated.connect(window._restore_from_tray)
-    window.show()
-    if notice:
-        QMessageBox.information(window, "Результат обновления", notice[1])
+        window = MainWindow()
+        instance.activated.connect(window._restore_from_tray)
+        window.show()
+        if notice:
+            QMessageBox.information(window, "Результат обновления", notice[1])
 
-    sys.exit(app.exec())
+        sys.exit(app.exec())
+    finally:
+        instance.release()
 
 
 if __name__ == "__main__":
