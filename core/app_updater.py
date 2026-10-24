@@ -29,6 +29,7 @@ import requests
 import psutil
 
 from core.app_version import get_app_version, is_newer
+from core.diagnostic_log import logger
 from core.paths import (
     APPUPDATE_API_LATEST_RELEASE,
     APPUPDATE_API_ALL_RELEASES,
@@ -194,6 +195,7 @@ def launch_installer_after_app_exit(setup_path: Path, expected_version: str) -> 
         raise AppUpdateError("Самообновление доступно только на Windows.")
 
     target_dir = installed_app_directory()
+    logger.info("Передача установщику ZapretDrum версии %s", expected_version)
     helper_path = setup_path.parent / "install.ps1"
     log_path = setup_path.parent / "installer.log"
     helper_log = setup_path.parent / "update-helper.log"
@@ -316,6 +318,7 @@ try {{
                 ready = False
             if ready:
                 exit_ready.write_text("exit requested\n", encoding="ascii")
+                logger.info("Помощник принял обновление; запрошен полный выход")
                 return
             time.sleep(0.1)
         helper.terminate()
@@ -364,6 +367,7 @@ def startup_update_notice() -> tuple[bool, str] | None:
             if status.get("helper_log"):
                 message += "\nЖурнал обновления: " + str(status["helper_log"])
         UPDATE_STATUS.unlink()
+        logger.info("Результат самообновления: %s", message)
         return False, message
     except (OSError, ValueError, TypeError):
         return False, f"Не удалось прочитать результат обновления. Подробности: {UPDATE_STATUS}"

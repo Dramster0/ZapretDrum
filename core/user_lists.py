@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from core.paths import ZAPRET_DIR
+from core.storage import atomic_write
 
 
 @dataclass(frozen=True)
@@ -88,11 +89,24 @@ def read_entries(user_list: UserList) -> list[str]:
 
 def _write_entries(user_list: UserList, entries: list[str]) -> None:
     path = _path_for(user_list)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = "\n".join(entries)
+    old = path.read_bytes() if path.exists() else b""
+    old_lines = old.decode("utf-8-sig").splitlines()
+    wanted = set(entries)
+    retained = set()
+    lines = []
+    for line in old_lines:
+        value = line.strip()
+        if not value or value.startswith("#"):
+            lines.append(line)
+        elif value in wanted:
+            lines.append(line)
+            retained.add(value)
+    lines.extend(value for value in entries if value not in retained)
+    text = "\n".join(lines)
     if text:
         text += "\n"
-    path.write_text(text, encoding="utf-8")
+    atomic_write(path.with_suffix(path.suffix + ".bak"), old)
+    atomic_write(path, text.encode("utf-8"))
 
 
 def add_entry(user_list: UserList, raw_value: str) -> tuple[bool, str]:

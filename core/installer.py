@@ -24,6 +24,9 @@ from typing import Callable, Optional
 import requests
 
 from core import process_manager
+from core import recovery
+from core.diagnostic_log import logger
+from core.state import load_state, save_state
 from core.paths import (
     ZAPRET_DIR,
     DOWNLOAD_TMP_DIR,
@@ -334,7 +337,15 @@ def _start_service() -> bool:
             timeout=15,
             creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
         )
-        return result.returncode in (0, 1056)
+        if result.returncode not in (0, 1056):
+            return False
+        from core.service_manager import get_service_status
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if get_service_status() == "running":
+                return True
+            time.sleep(0.2)
+        return False
     except Exception:  # noqa: BLE001
         return False
 
@@ -349,6 +360,7 @@ def install_or_update(progress_cb: ProgressCB = None, release: ReleaseInfo | Non
     if release is None:
         _report(progress_cb, "Проверяю последнюю версию...", 0.02)
         release = fetch_latest_release()
+    logger.info("Начато обновление zapret до %s", release.tag_name)
 
     job_dir = Path(tempfile.mkdtemp(prefix="zapret-update-", dir=DOWNLOAD_TMP_DIR))
     zip_path = job_dir / "release.zip"
@@ -377,11 +389,45 @@ def install_or_update(progress_cb: ProgressCB = None, release: ReleaseInfo | Non
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
 
+    return _apply_prepared_install(src_root, job_dir, release, progress_cb)
+
+
+def _apply_prepared_install(src_root: Path, job_dir: Path, release: ReleaseInfo,
+                            progress_cb: ProgressCB = None, restored_state: dict | None = None) -> ReleaseInfo:
+    """Shared replacement path for downloads and verified offline snapshots."""
+    if not (src_root / "bin/winws.exe").is_file() or not (src_root / "service.bat").is_file():
+        raise InstallerError("Подготовленная установка неполна. Текущие файлы сохранены.")
+
     # Освобождаем файлы: останавливаем winws.exe, службу zapret и драйвер
     # WinDivert. Если этого не сделать, часть старых файлов остаётся занята.
     service_was_running = IS_WINDOWS and _service_running()
+    old_strategy = process_manager.inspect_processes()["strategy"] if IS_WINDOWS else None
+
+    def resume_previous() -> None:
+        if service_was_running:
+            _start_service()
+        elif old_strategy:
+            from core.strategies import find_strategy
+            strategy = find_strategy(old_strategy)
+            if strategy:
+                try:
+                    process_manager.start_strategy(strategy)
+                except Exception:
+                    logger.exception("После ошибки не удалось возобновить прежнюю стратегию")
+
     _report(progress_cb, "Останавливаю zapret перед обновлением...", 0.82)
     release_locks()
+    if IS_WINDOWS:
+        remaining = process_manager.inspect_processes()
+        if remaining["own"] or remaining["unknown"]:
+            raise InstallerError("Остановка winws.exe не подтверждена. Файлы не заменены; проверьте диагностику.")
+    _report(progress_cb, "Сохраняю предыдущую версию zapret...", 0.86)
+    try:
+        recovery.capture_backup()
+        recovery.begin_transaction(release.tag_name)
+    except Exception as exc:
+        resume_previous()
+        raise InstallerError("Не удалось сохранить резервную копию. Файлы zapret не заменены. " + str(exc)) from exc
 
     # Directory renames are all-or-nothing. Do not merge versions or delete
     # the old files until the new directory has taken its place.
@@ -397,20 +443,50 @@ def install_or_update(progress_cb: ProgressCB = None, release: ReleaseInfo | Non
                 previous.rename(ZAPRET_DIR)
             raise
     except OSError as exc:
-        if service_was_running and _winws_path().exists():
-            _start_service()
+        logger.exception("Не удалось заменить папку zapret")
+        if not previous.exists() and _winws_path().is_file():
+            try:
+                recovery.TRANSACTION_FILE.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Не удалось убрать отметку прерванной операции")
+            resume_previous()
         raise InstallerError(
             "Не удалось заменить установку целиком. Новая версия не применена. "
             f"Предыдущие файлы сохранены в {ZAPRET_DIR if ZAPRET_DIR.exists() else previous}. "
             "Закройте использующие их программы и повторите обновление. " + str(exc)
         ) from exc
 
-    if service_was_running:
+    try:
+        state = load_state()
+        if restored_state is not None:
+            for key in recovery.COMPONENT_FIELDS:
+                setattr(state, key, restored_state[key])
+        else:
+            state.installed_version = release.tag_name
+            state.last_test_results = []
+        save_state(state)
+        recovery.finish_transaction()
+    except OSError as exc:
+        logger.exception("Файлы заменены, но результат не удалось сохранить")
+        if service_was_running and restored_state is None:
+            _start_service()
+        hint = ("Предыдущая версия доступна для восстановления. " if recovery.latest_backup()
+                else "Проверьте диагностику и повторите установку. ")
+        raise InstallerError("Файлы zapret заменены, но сохранить результат не удалось. "
+                             + hint + str(exc)) from exc
+
+    if restored_state is not None and IS_WINDOWS:
+        from core.service_manager import service_belongs_to_install
+        if service_belongs_to_install("zapret"):
+            release.warning = ("Служба оставлена остановленной: её параметры могут относиться к другой версии. "
+                               "На главной странице заново установите нужную стратегию как службу.")
+    elif service_was_running:
         if not _start_service():
             release.warning = "Файлы обновлены, но службу zapret запустить не удалось. Проверьте её состояние на главной странице."
 
     # уборка временных файлов
     shutil.rmtree(job_dir, ignore_errors=True)
 
+    logger.info("Замена zapret завершена: %s; предупреждение: %s", release.tag_name, release.warning or "нет")
     _report(progress_cb, "Готово", 1.0)
     return release

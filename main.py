@@ -43,6 +43,11 @@ def main() -> None:
         if _relaunch_as_admin_windows():
             sys.exit(0)
 
+    from core.diagnostic_log import setup_logging, logger
+    from core.app_version import get_app_version
+    setup_logging()
+    logger.info("Запуск ZapretDrum %s", get_app_version())
+
     from PyQt6.QtWidgets import QApplication, QMessageBox
     from PyQt6.QtGui import QIcon
     from PyQt6.QtCore import QTimer
@@ -85,10 +90,16 @@ def main() -> None:
         window.show()
         if notice:
             QMessageBox.information(window, "Результат обновления", notice[1])
+        from core.state import recovery_notice
+        from core.recovery import pending_notice
+        recovery_message = "\n\n".join(message for message in (recovery_notice(), pending_notice()) if message)
+        if recovery_message:
+            QMessageBox.warning(window, "Восстановление данных", recovery_message)
 
         sys.exit(app.exec())
     finally:
         instance.release()
+        logger.info("Завершение ZapretDrum")
 
 
 if __name__ == "__main__":

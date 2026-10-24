@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import psutil
 from typing import Callable, Optional
 from pathlib import Path
 
@@ -190,7 +191,7 @@ def install_as_service(strategy: Strategy, log_cb: LogCB = None) -> tuple[bool, 
 
         batch.close()
         full_log = batch.text()
-        success = ("CreateService SUCCESS" in full_log) or ("StartService SUCCESS" in full_log)
+        success = service_belongs_to_install(SERVICE_NAME) and get_service_status() == "running"
         return success, full_log
     finally:
         batch.close()
@@ -224,28 +225,15 @@ def remove_service(log_cb: LogCB = None) -> tuple[bool, str]:
 
 
 def get_service_status() -> str:
-    """Возвращает 'running' | 'stopped' | 'not_installed'."""
+    """Read the native Windows state, independent of the OS display language."""
     if not IS_WINDOWS:
         return "not_installed"
     try:
-        result = subprocess.run(
-            ["sc", "query", SERVICE_NAME],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
-        )
-    except Exception:
+        return psutil.win_service_get(SERVICE_NAME).status()
+    except psutil.NoSuchProcess:
         return "not_installed"
-
-    out = (result.stdout or "") + (result.stderr or "")
-    if "does not exist" in out.lower():
-        return "not_installed"
-    if "RUNNING" in out:
-        return "running"
-    if "STOPPED" in out:
-        return "stopped"
-    return "not_installed"
+    except (psutil.Error, OSError):
+        return "unknown"
 
 
 def get_installed_service_strategy_name() -> str | None:

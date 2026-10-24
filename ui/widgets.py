@@ -169,6 +169,11 @@ class PowerButton(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._connected = False
         self._busy = False
+        self._unknown = False
+
+    def set_unknown(self, unknown: bool) -> None:
+        self._unknown = unknown
+        self.update()
 
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
@@ -241,7 +246,9 @@ class PowerButton(QWidget):
         font = QFont("Segoe UI", 10)
         font.setBold(True)
         painter.setFont(font)
-        text = "Подключено" if self._connected else ("Подключение..." if self._busy else "Отключено")
+        text = "Обход запущен" if self._connected else ("Запуск..." if self._busy else "Не запущен")
+        if self._unknown:
+            text = "Неизвестно"
         painter.drawText(
             QRectF(cx - inner_r, icon_cy + icon_r + 10, inner_r * 2, 24),
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,

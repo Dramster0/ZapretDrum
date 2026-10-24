@@ -4,6 +4,7 @@ from inspect import signature
 
 from PyQt6.QtCore import QObject, QTimer
 from PyQt6.QtWidgets import QMessageBox
+from core.diagnostic_log import logger
 
 
 def exclusive_action(method):
@@ -16,12 +17,14 @@ def exclusive_action(method):
             return
         operations.active = True
         operations.in_callback = True
+        logger.info("Действие: %s.%s", type(self).__name__, method.__name__)
         window.set_operation_enabled(False, self)
         try:
             # clicked(bool) can reach the variadic wrapper even when the
             # original slot takes no arguments.
             return method(self, *(args if accepts_arguments else ()), **kwargs)
         except Exception as exc:
+            logger.exception("Ошибка действия %s", method.__name__)
             QMessageBox.warning(window, "Не удалось выполнить действие", str(exc))
         finally:
             operations.in_callback = False
@@ -43,6 +46,9 @@ class Operations(QObject):
 
     def start(self, worker):
         self.workers.add(worker)
+        logger.info("Фоновая задача начата: %s", type(worker).__name__)
+        if hasattr(worker, "finished_error"):
+            worker.finished_error.connect(lambda message: logger.error("%s: %s", type(worker).__name__, message))
         worker.finished.connect(lambda: self._worker_finished(worker))
         try:
             worker.start()
@@ -52,6 +58,7 @@ class Operations(QObject):
         self.timer.start()
 
     def _worker_finished(self, worker):
+        logger.info("Фоновая задача завершена: %s", type(worker).__name__)
         self.workers.discard(worker)
         QTimer.singleShot(0, self.finish_if_idle)
 

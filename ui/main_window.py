@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QSystemTrayIcon,
     QSizePolicy,
     QStatusBar,
+    QComboBox,
 )
 
 from core import process_manager
@@ -36,6 +37,8 @@ from core import app_updater
 from core import tg_manager
 from core import tg_installer
 from core import conflict_detector
+from core import recovery
+from core.diagnostic_log import logger
 from core.app_version import get_app_version
 from core.paths import (
     APP_DATA_DIR,
@@ -54,6 +57,7 @@ from core.updater import check_for_updates, UpdateCheckResult
 from ui.theme import STYLESHEET, TEXT_PRIMARY, TEXT_SECONDARY, BG, BG_ELEVATED, SUCCESS, DANGER, BORDER, ACCENT
 from ui.widgets import Card, StrategyRow, PowerButton, StatusDot, make_avatar, nav_button, MainTitleBar, DialogTitleBar, ResizeGrip
 from ui.operations import Operations, exclusive_action
+from ui.diagnostics_page import DiagnosticsPage
 from ui.workers import (
     CallWorker,
     InstallWorker,
@@ -590,8 +594,7 @@ class HomePage(QWidget):
             self.rows[preselect].set_selected(True)
         self._update_selected_card()
 
-        running = process_manager.is_running() if process_manager.IS_WINDOWS else False
-        self.refresh(running, state.last_strategy if running else None)
+        self.main_window._refresh_status()
 
     def _on_row_clicked(self, file_name: str) -> None:
         self.selected_file_name = file_name
@@ -760,49 +763,66 @@ class HomePage(QWidget):
         self._refresh_service_status()
         QMessageBox.warning(self, "Ошибка", message)
 
-    def _refresh_service_status(self) -> None:
+    def _refresh_service_status(self) -> tuple[str, bool]:
         if not process_manager.IS_WINDOWS:
             self.service_status_label.setText("Доступно только на Windows")
             self.install_service_btn.setEnabled(False)
             self.remove_service_btn.setEnabled(False)
-            return
+            return "not_installed", False
 
         status = service_manager.get_service_status()
-        name = service_manager.get_installed_service_strategy_name()
-        if status == "running":
+        owned = service_manager.service_belongs_to_install("zapret")
+        name = service_manager.get_installed_service_strategy_name() if owned else None
+        self.install_service_btn.setEnabled(status == "not_installed" or owned)
+        self.remove_service_btn.setEnabled(owned)
+        self.service_status_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
+        if status == "unknown":
+            self.service_status_label.setText("Не удалось определить состояние службы. Откройте диагностику.")
+        elif status != "not_installed" and not owned:
+            self.service_status_label.setText("Обнаружена служба другой установки или её путь недоступен. Изменение службы отключено.")
+        elif status == "running":
             suffix = f" ({name})" if name else ""
             self.service_status_label.setText(f"● Служба работает{suffix} - запускается вместе с Windows")
             self.service_status_label.setStyleSheet(f"color: {SUCCESS}; font-size: 11px; font-weight: 600;")
         elif status == "stopped":
             self.service_status_label.setText("Служба установлена, но остановлена")
             self.service_status_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
-        else:
+        elif status == "not_installed":
             self.service_status_label.setText("Служба не установлена (используется обычный запуск)")
             self.service_status_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
+        else:
+            self.service_status_label.setText("Служба меняет состояние: " + status)
+        return status, owned
 
-    def refresh(self, running: bool, current_file_name: str | None) -> None:
+    def refresh(self, running: bool, current_file_name: str | None, foreign: int = 0, unknown: int = 0) -> None:
         installed = is_installed()
         self.install_card.setVisible(not installed)
-        self.power_button.setEnabled(installed or running)
+        self.power_button.setEnabled((installed or running) and not unknown)
         self.power_button.set_busy(False)
         self.power_button.set_connected(running)
+        self.power_button.set_unknown(bool(unknown) and not running)
 
+        service_status, owned_service = self._refresh_service_status()
+        if owned_service and service_status == "running":
+            current_file_name = service_manager.get_installed_service_strategy_name()
         for fn, row in self.rows.items():
             row.set_active(running and fn == current_file_name)
 
-        self._refresh_service_status()
-
-        if running and current_file_name:
+        if running and owned_service and service_status == "running":
+            self.status_caption.setText("Обход запущен службой Windows. " +
+                                        (f"Стратегия: {current_file_name}" if current_file_name else "Стратегия не определена."))
+        elif running and current_file_name:
             self.status_caption.setText(f"Запущена стратегия: {current_file_name}")
-        elif running and not installed:
-            self.status_caption.setText(
-                "⚠ Обнаружен уже запущенный процесс winws.exe (не из этого приложения). "
-                "Кнопка остановит его так же, как и свой."
-            )
         elif running:
-            self.status_caption.setText("winws.exe запущен")
+            self.status_caption.setText("Обход запущен из нашей папки. Название стратегии не подтверждено.")
+        elif unknown:
+            self.status_caption.setText("Состояние обхода не определено.")
         else:
-            self.status_caption.setText("")
+            self.status_caption.setText("Обход не запущен.")
+        if foreign:
+            self.status_caption.setText(self.status_caption.text() + " Обнаружен сторонний winws.exe; возможен конфликт.")
+        if unknown:
+            self.status_caption.setText(self.status_caption.text() + " Путь части процессов недоступен. Откройте диагностику.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1489,7 +1509,59 @@ class UpdatePage(QWidget):
         note.setStyleSheet(f"color: {TEXT_SECONDARY};")
         root.addWidget(note)
 
+        recovery_card = Card()
+        recovery_title = QLabel("Возврат к предыдущей версии zapret")
+        recovery_title.setObjectName("sectionLabel")
+        recovery_card.body.addWidget(recovery_title)
+        self.backup_label = QLabel()
+        self.backup_label.setWordWrap(True)
+        recovery_card.body.addWidget(self.backup_label)
+        self.backup_choice = QComboBox()
+        self.backup_choice.setStyleSheet(
+            f"QComboBox {{ background: {BG_ELEVATED}; color: {TEXT_PRIMARY}; border: 1px solid {BORDER}; padding: 8px; }}"
+            f"QComboBox QAbstractItemView {{ background: {BG_ELEVATED}; color: {TEXT_PRIMARY}; selection-background-color: {ACCENT}; }}")
+        recovery_card.body.addWidget(self.backup_choice)
+        self.rollback_button = QPushButton("Восстановить предыдущую версию")
+        self.rollback_button.setObjectName("secondaryButton")
+        self.rollback_button.clicked.connect(self.rollback)
+        recovery_card.body.addWidget(self.rollback_button)
+        root.addWidget(recovery_card)
+        self.refresh_backup()
+
         root.addStretch(1)
+
+    def refresh_backup(self) -> None:
+        backups = recovery.available_backups()
+        selected = self.backup_choice.currentData()
+        self.backup_choice.clear()
+        for backup in backups:
+            self.backup_choice.addItem(f"{backup.version} — {backup.created_at[:19].replace('T', ' ')} UTC", backup.path.name)
+        selected_index = self.backup_choice.findData(selected) if selected else -1
+        if selected_index >= 0:
+            self.backup_choice.setCurrentIndex(selected_index)
+        self.backup_label.setText(
+            "Выберите сохранённую копию. Восстановление работает без интернета; хранятся две последние копии."
+            if backups else "Копия появится после обновления установленного zapret.")
+        self.backup_choice.setVisible(bool(backups))
+        self.rollback_button.setEnabled(bool(backups))
+
+    @exclusive_action
+    def rollback(self) -> None:
+        backup = next((entry for entry in recovery.available_backups() if entry.path.name == self.backup_choice.currentData()), None)
+        if backup is None:
+            self.refresh_backup()
+            return
+        if not _confirm(self, "Восстановить zapret?",
+                        f"Будет восстановлена версия {backup.version}, её списки доменов и выбор стратегий. "
+                        "Изменения списков после создания копии будут отменены. Текущая установка тоже будет сохранена. "
+                        "Работающий обход остановится. После восстановления запустите стратегию вручную; "
+                        "если используется служба, заново установите её с нужной стратегией."):
+            return
+        self.main_window.set_busy(True, "Восстанавливаю сохранённую версию zapret…")
+        self.restore_worker = CallWorker(lambda: recovery.restore_previous(backup.path.name))
+        self.restore_worker.finished_ok.connect(self._on_finished)
+        self.restore_worker.finished_error.connect(self._on_error)
+        self.main_window.operations.start(self.restore_worker)
 
     @exclusive_action
     def check_updates(self) -> None:
@@ -1628,18 +1700,15 @@ class UpdatePage(QWidget):
         self.progress_bar.setValue(int(frac * 100))
 
     def _on_finished(self, release: ReleaseInfo) -> None:
-        state = load_state()
-        state.installed_version = release.tag_name
-        save_state(state)
-
         self.update_button.setEnabled(True)
         self.check_button.setEnabled(True)
         self.choose_version_button.setEnabled(True)
         self.installed_label.setText(f"Установленная версия: {release.tag_name}")
-        self.latest_label.setText(f"Последняя версия: {release.tag_name}")
+        self.latest_label.setText("Последняя версия: нажмите «Проверить обновления»")
         self._check_error = ""
         self.error_details_btn.setVisible(False)
-        self.update_button.setText("У вас последняя версия (переустановить)")
+        self.update_button.setText("Скачать и установить одной кнопкой")
+        self.refresh_backup()
         self.main_window.set_busy(False)
         self.main_window.notify_installed()
         message = f"zapret установлен, версия {release.tag_name}."
@@ -1653,6 +1722,7 @@ class UpdatePage(QWidget):
         self.check_button.setEnabled(True)
         self.choose_version_button.setEnabled(True)
         self.progress_label.setText("Ошибка")
+        self.refresh_backup()
         self.main_window.set_busy(False)
         QMessageBox.warning(self, "Ошибка обновления", message)
 
@@ -2049,7 +2119,12 @@ class DomainListSection(QWidget):
             self.rows_layout.insertWidget(self.rows_layout.count() - 1, row)
 
     def _on_add(self) -> None:
-        ok, error = user_lists.add_entry(self.user_list, self.input.text())
+        try:
+            ok, error = user_lists.add_entry(self.user_list, self.input.text())
+        except (OSError, UnicodeError) as exc:
+            logger.exception("Не удалось сохранить пользовательский список")
+            QMessageBox.warning(self, "Список не сохранён", str(exc))
+            return
         if ok:
             self.input.clear()
             self.reload()
@@ -2064,7 +2139,12 @@ class DomainListSection(QWidget):
         )
         if not confirm:
             return
-        user_lists.remove_entry(self.user_list, value)
+        try:
+            user_lists.remove_entry(self.user_list, value)
+        except (OSError, UnicodeError) as exc:
+            logger.exception("Не удалось удалить запись из пользовательского списка")
+            QMessageBox.warning(self, "Список не сохранён", str(exc))
+            return
         self.reload()
 
 
@@ -2265,6 +2345,7 @@ class MainWindow(QMainWindow):
             ("autotest", "🎯", "Автоподбор"),
             ("telegram", "✈️", "Telegram"),
             ("update", "⬇️", "Обновление"),
+            ("diagnostics", "🔎", "Диагностика"),
             ("settings", "⚙️", "Настройки"),
         ]
         for key, icon, label in nav_items:
@@ -2301,6 +2382,7 @@ class MainWindow(QMainWindow):
         self.telegram_page = TelegramPage(self)
         self.update_page = UpdatePage(self)
         self.settings_page = SettingsPage(self)
+        self.diagnostics_page = DiagnosticsPage(self)
 
         self.pages = {
             "home": self.home_page,
@@ -2309,6 +2391,7 @@ class MainWindow(QMainWindow):
             "telegram": self.telegram_page,
             "update": self.update_page,
             "settings": self.settings_page,
+            "diagnostics": self.diagnostics_page,
         }
         for page in self.pages.values():
             self.stack.addWidget(page)
@@ -2415,6 +2498,8 @@ class MainWindow(QMainWindow):
             self.domains_page.reload()
         if key == "telegram" and not self.operations.active:
             self.telegram_page.refresh()
+        if key == "update" and not self.operations.active:
+            self.update_page.refresh_backup()
 
     def set_busy(self, busy: bool, message: str = "") -> None:
         self.statusBar().showMessage(message if busy else "", 0)
@@ -2535,9 +2620,8 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ #
     def _refresh_status(self) -> None:
-        running = process_manager.is_running() if process_manager.IS_WINDOWS else False
-        current = load_state().last_strategy if running else None
-        self.home_page.refresh(running, current)
+        observed = process_manager.inspect_processes()
+        self.home_page.refresh(bool(observed["own"]), observed["strategy"], observed["foreign"], observed["unknown"])
         if self.stack.currentWidget() is self.telegram_page:
             self.telegram_page.refresh()
 

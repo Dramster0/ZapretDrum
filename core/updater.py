@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from core.installer import fetch_latest_release, InstallerError, ReleaseInfo
 from core.state import load_state
+from core.diagnostic_log import logger
 
 
 @dataclass
@@ -23,6 +24,7 @@ def check_for_updates() -> UpdateCheckResult:
     try:
         latest = fetch_latest_release()
     except InstallerError as exc:
+        logger.warning("Не удалось проверить обновление zapret: %s", exc)
         return UpdateCheckResult(
             installed_version=state.installed_version,
             latest=None,
