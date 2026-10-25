@@ -225,6 +225,14 @@ QWidget#strategyRow {{
     border: 1px solid {BORDER};
     border-radius: 10px;
 }}
+QWidget#strategyRowSelected {{
+    background-color: {BG_ELEVATED};
+    border: 1px solid {TEXT_SECONDARY};
+    border-radius: 10px;
+}}
+QWidget#strategyRow:focus, QWidget#strategyRowSelected:focus {{
+    border: 2px solid {TEXT_PRIMARY};
+}}
 QWidget#strategyRowActive {{
     background-color: rgba(224, 32, 63, 0.18);
     border: 2px solid {ACCENT};

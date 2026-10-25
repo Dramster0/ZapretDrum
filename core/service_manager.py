@@ -22,7 +22,8 @@ import subprocess
 import sys
 import threading
 import time
-import psutil
+import ctypes
+from ctypes import wintypes
 from typing import Callable, Optional
 from pathlib import Path
 
@@ -224,16 +225,89 @@ def remove_service(log_cb: LogCB = None) -> tuple[bool, str]:
     return success, "\n".join(lines)
 
 
-def get_service_status() -> str:
-    """Read the native Windows state, independent of the OS display language."""
-    if not IS_WINDOWS:
-        return "not_installed"
+class _ServiceStatus(ctypes.Structure):
+    _fields_ = [(name, wintypes.DWORD) for name in (
+        "service_type", "current_state", "controls_accepted", "win32_exit_code",
+        "service_exit_code", "checkpoint", "wait_hint",
+    )]
+
+
+def _query_service_state() -> int:
+    """Query status only: psutil.win_service_get also reads configuration,
+    which can fail with Windows error 1734 for a long zapret command line.
+    Explicit handle types are required on 64-bit Windows.
+    """
+    api = ctypes.WinDLL("advapi32", use_last_error=True)
+    api.OpenSCManagerW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    api.OpenSCManagerW.restype = wintypes.HANDLE
+    api.OpenServiceW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD]
+    api.OpenServiceW.restype = wintypes.HANDLE
+    api.QueryServiceStatus.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ServiceStatus)]
+    api.QueryServiceStatus.restype = wintypes.BOOL
+    api.CloseServiceHandle.argtypes = [wintypes.HANDLE]
+    api.CloseServiceHandle.restype = wintypes.BOOL
+    manager = api.OpenSCManagerW(None, None, 0x0001)  # SC_MANAGER_CONNECT
+    if not manager:
+        raise ctypes.WinError(ctypes.get_last_error())
     try:
-        return psutil.win_service_get(SERVICE_NAME).status()
-    except psutil.NoSuchProcess:
-        return "not_installed"
-    except (psutil.Error, OSError):
-        return "unknown"
+        service = api.OpenServiceW(manager, SERVICE_NAME, 0x0004)  # SERVICE_QUERY_STATUS
+        if not service:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            status = _ServiceStatus()
+            if not api.QueryServiceStatus(service, ctypes.byref(status)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return status.current_state
+        finally:
+            api.CloseServiceHandle(service)
+    finally:
+        api.CloseServiceHandle(manager)
+
+
+def get_service_status_details() -> tuple[str, str]:
+    """Keep absent, transitional and unreadable states distinct."""
+    if not IS_WINDOWS:
+        return "not_installed", ""
+    try:
+        state = _query_service_state()
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1060:  # ERROR_SERVICE_DOES_NOT_EXIST
+            return "not_installed", ""
+        if getattr(exc, "winerror", None) == 5:
+            return "unknown", "Windows отказала в чтении состояния службы (код 5). Запустите ZapretDrum от имени администратора."
+        return "unknown", f"Ошибка чтения состояния службы Windows: {exc}"
+    states = {1: "stopped", 2: "start_pending", 3: "stop_pending", 4: "running",
+              5: "continue_pending", 6: "pause_pending", 7: "paused"}
+    if state not in states:
+        return "unknown", f"Windows вернула неизвестное состояние службы: {state}."
+    return states[state], ""
+
+
+def get_service_status() -> str:
+    return get_service_status_details()[0]
+
+
+def set_owned_service_running(running: bool) -> None:
+    """Change only our service and wait for the actual state."""
+    _require_windows()
+    if not service_belongs_to_install(SERVICE_NAME):
+        raise ServiceError("Принадлежность службы zapret не подтверждена. Откройте диагностику.")
+    target = "running" if running else "stopped"
+    if get_service_status() == target:
+        return
+    result = subprocess.run(["sc", "start" if running else "stop", SERVICE_NAME],
+                            capture_output=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode not in (0, 1056 if running else 1062):
+        raise ServiceError(f"Не удалось изменить состояние службы zapret (код {result.returncode}).")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        state, error = get_service_status_details()
+        if state == target:
+            return
+        if state == "unknown":
+            raise ServiceError("Команда отправлена, но результат не удалось проверить. " + error)
+        time.sleep(0.2)
+    raise ServiceError("Служба zapret не перешла в ожидаемое состояние: " + target)
 
 
 def get_installed_service_strategy_name() -> str | None:

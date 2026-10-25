@@ -13,7 +13,7 @@ from core.state import load_state, STATE_BACKUP, recovery_notice
 def build_report(check_network: bool = False) -> str:
     state = load_state()
     processes = process_manager.inspect_processes()
-    service = service_manager.get_service_status()
+    service, service_error = service_manager.get_service_status_details()
     owner = service_manager.service_belongs_to_install("zapret")
     backup = recovery.latest_backup()
     lines = ["Диагностика ZapretDrum", "Дата: " + datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -28,6 +28,7 @@ def build_report(check_network: bool = False) -> str:
              (len(processes["own"]), processes["foreign"], processes["unknown"]),
              "Подтверждённая стратегия обычного запуска: " + (processes["strategy"] or "не определена"),
              "Состояние службы zapret: " + service,
+             service_error,
              "Принадлежность службы: " + ("наша установка" if owner else "не подтверждена / служба отсутствует"), "",
              "Копия настроек: " + ("есть" if STATE_BACKUP.is_file() else "пока нет"),
              "Копия zapret: " + (backup.version + " от " + backup.created_at if backup else "пока нет"),

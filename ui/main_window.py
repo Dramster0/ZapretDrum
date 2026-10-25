@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QStatusBar,
     QComboBox,
+    QCheckBox,
 )
 
 from core import process_manager
@@ -58,13 +59,13 @@ from ui.theme import STYLESHEET, TEXT_PRIMARY, TEXT_SECONDARY, BG, BG_ELEVATED, 
 from ui.widgets import Card, StrategyRow, PowerButton, StatusDot, make_avatar, nav_button, MainTitleBar, DialogTitleBar, ResizeGrip
 from ui.operations import Operations, exclusive_action
 from ui.diagnostics_page import DiagnosticsPage
+from ui.autotest_page import AutoTestPage
 from ui.workers import (
     CallWorker,
     InstallWorker,
     FetchReleasesWorker,
     StartStrategyWorker,
     StopWorker,
-    AutoTestWorker,
     InstallServiceWorker,
     RemoveServiceWorker,
     CheckAppUpdateWorker,
@@ -385,7 +386,7 @@ def _ping_text_for(file_name: str, results: list[dict]) -> tuple[str, bool | Non
             success, total = r.get("success", 0), r.get("total", 0)
             latency = r.get("avg_latency_ms")
             if success == 0:
-                return "Timeout", False
+                return f"{success}/{total}", False
             if latency:
                 return f"{latency:.0f} ms", success == total
             return f"{success}/{total}", success == total
@@ -407,17 +408,23 @@ class HomePage(QWidget):
         root.setSpacing(14)
 
         self.install_card = Card()
-        install_label = QLabel("zapret ещё не установлен")
+        install_label = QLabel("Быстрый старт")
         install_label.setStyleSheet("font-weight: 700; font-size: 14px;")
         self.install_card.body.addWidget(install_label)
         install_hint = QLabel("Нажмите, чтобы скачать последнюю версию с GitHub — это займёт меньше минуты.")
         install_hint.setStyleSheet(f"color: {TEXT_SECONDARY};")
         install_hint.setWordWrap(True)
+        self.quick_start_hint = install_hint
         self.install_card.body.addWidget(install_hint)
         install_btn = QPushButton("Скачать и установить zapret")
         install_btn.setObjectName("primaryButton")
-        install_btn.clicked.connect(lambda: main_window.go_to("update"))
+        self.quick_start_btn = install_btn
+        install_btn.clicked.connect(self._quick_start_action)
         self.install_card.body.addWidget(install_btn)
+        hide_steps = QPushButton("Скрыть подсказки")
+        hide_steps.setObjectName("secondaryButton")
+        hide_steps.clicked.connect(self._hide_quick_start)
+        self.install_card.body.addWidget(hide_steps)
         root.addWidget(self.install_card)
 
         content_row = QHBoxLayout()
@@ -433,9 +440,9 @@ class HomePage(QWidget):
         list_title.setStyleSheet("font-size: 16px; font-weight: 700;")
         header_row.addWidget(list_title)
         header_row.addStretch(1)
-        self.refresh_btn = QPushButton("Обновить")
+        self.refresh_btn = QPushButton("Пересканировать")
         self.refresh_btn.setObjectName("secondaryButton")
-        self.refresh_btn.setFixedWidth(130)
+        self.refresh_btn.setMinimumWidth(155)
         self.refresh_btn.setToolTip(
             "Повторно просканировать папку zapret и обновить список .bat-стратегий. "
             "Полезно после ручного добавления или удаления файлов стратегий."
@@ -445,7 +452,7 @@ class HomePage(QWidget):
         self.refresh_feedback_timer = QTimer(self)
         self.refresh_feedback_timer.setSingleShot(True)
         self.refresh_feedback_timer.timeout.connect(
-            lambda: self.refresh_btn.setText("Обновить")
+            lambda: self.refresh_btn.setText("Пересканировать")
         )
         left_card.body.addLayout(header_row)
 
@@ -504,6 +511,10 @@ class HomePage(QWidget):
         self.status_caption.setWordWrap(True)
         self.status_caption.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
         selected_card.body.addWidget(self.status_caption)
+        self.favorite_btn = QPushButton("☆ Сделать избранной")
+        self.favorite_btn.setObjectName("secondaryButton")
+        self.favorite_btn.clicked.connect(self._toggle_favorite)
+        selected_card.body.addWidget(self.favorite_btn)
 
         mode_row = QVBoxLayout()
         mode_row.setSpacing(8)
@@ -558,8 +569,11 @@ class HomePage(QWidget):
 
         right_container = QWidget()
         right_container.setLayout(right_col)
-        right_container.setFixedWidth(300)
-        content_row.addWidget(right_container, 2)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFixedWidth(320)
+        right_scroll.setWidget(right_container)
+        content_row.addWidget(right_scroll, 2)
 
     # ------------------------------------------------------------------ #
     def _on_refresh_clicked(self) -> None:
@@ -584,13 +598,17 @@ class HomePage(QWidget):
             row = StrategyRow(strategy.name, strategy.file_name)
             text, ok = _ping_text_for(strategy.file_name, state.last_test_results)
             row.set_ping_text(text, ok)
+            row.set_favorite(strategy.file_name == state.favorite_strategy)
+            row.ping_label.setToolTip("HTTP-проверка, не игровой пинг. Последний полный прогон: " +
+                                     (state.last_test_at or "дата неизвестна"))
             row.clicked.connect(self._on_row_clicked)
             self.list_layout.insertWidget(self.list_layout.count() - 1, row)
             self.rows[strategy.file_name] = row
 
-        preselect = state.favorite_strategy or state.last_strategy
-        if preselect and preselect in self.rows:
-            self.selected_file_name = preselect
+        preselect = next((name for name in (self.selected_file_name, state.favorite_strategy, state.last_strategy)
+                          if name in self.rows), None)
+        self.selected_file_name = preselect
+        if preselect:
             self.rows[preselect].set_selected(True)
         self._update_selected_card()
 
@@ -604,6 +622,9 @@ class HomePage(QWidget):
 
     def _update_selected_card(self) -> None:
         strategy = find_strategy(self.selected_file_name) if self.selected_file_name else None
+        self.favorite_btn.setEnabled(strategy is not None)
+        self.favorite_btn.setText("★ Убрать из избранного" if strategy and load_state().favorite_strategy == strategy.file_name
+                                  else "☆ Сделать избранной")
         if strategy is None:
             self.selected_name_label.setText("Стратегия не выбрана")
             self.selected_sub_label.setText("Выберите стратегию слева")
@@ -616,6 +637,47 @@ class HomePage(QWidget):
         self.selected_avatar_holder.replaceWidget(old_avatar, self.selected_avatar)
         old_avatar.setParent(None)
         old_avatar.deleteLater()
+
+    @exclusive_action
+    def _toggle_favorite(self) -> None:
+        if not self.selected_file_name or find_strategy(self.selected_file_name) is None:
+            return
+        state = load_state()
+        state.favorite_strategy = None if state.favorite_strategy == self.selected_file_name else self.selected_file_name
+        save_state(state)
+        for name, row in self.rows.items():
+            row.set_favorite(name == state.favorite_strategy)
+        self._update_selected_card()
+
+    def _hide_quick_start(self) -> None:
+        self.main_window.settings_page._save_preference("show_quick_start", False)
+
+    def _quick_start_action(self) -> None:
+        if self._quick_start_target == "service_help":
+            QMessageBox.information(self, "Автозапуск",
+                "На главной выберите стратегию и нажмите «Установить как службу». "
+                "Для tg-ws-proxy автозапуск включается отдельно на вкладке Telegram. "
+                "Перед этим проверьте работу сайтов и приложений вручную.")
+        else:
+            self.main_window.go_to(self._quick_start_target)
+
+    def _refresh_quick_start(self, installed, running) -> None:
+        state = load_state()
+        self.install_card.setVisible(state.show_quick_start)
+        if not installed:
+            text, action, target = "Шаг 1. Установите компонент zapret через вкладку «Обновление».", "Открыть установку", "update"
+        elif running:
+            text, action, target = "Обход запущен. Проверьте Discord и YouTube. При необходимости настройте автозапуск.", "Как включить автозапуск", "service_help"
+        elif (state.last_test_at and state.last_test_version == state.installed_version
+              and any(result["success"] for result in state.last_test_results)):
+            text, action, target = "Шаг 3. Откройте результаты автоподбора и запустите подходящую стратегию.", "Открыть результаты", "autotest"
+        elif state.last_test_at and state.last_test_version == state.installed_version:
+            text, action, target = "Успешная стратегия пока не найдена. Проверьте соединение и диагностику, затем повторите автоподбор.", "Открыть диагностику", "diagnostics"
+        else:
+            text, action, target = "Шаг 2. Компонент установлен. Подберите стратегию для своей сети.", "Открыть автоподбор", "autotest"
+        self.quick_start_hint.setText(text)
+        self.quick_start_btn.setText(action)
+        self._quick_start_target = target
 
     def _target_strategy(self) -> Strategy | None:
         if self.selected_file_name:
@@ -796,7 +858,7 @@ class HomePage(QWidget):
 
     def refresh(self, running: bool, current_file_name: str | None, foreign: int = 0, unknown: int = 0) -> None:
         installed = is_installed()
-        self.install_card.setVisible(not installed)
+        self._refresh_quick_start(installed, running)
         self.power_button.setEnabled((installed or running) and not unknown)
         self.power_button.set_busy(False)
         self.power_button.set_connected(running)
@@ -826,179 +888,7 @@ class HomePage(QWidget):
 
 
 # --------------------------------------------------------------------------- #
-# Автоподбор
-# --------------------------------------------------------------------------- #
-class AutoTestPage(QWidget):
-    def __init__(self, main_window: "MainWindow"):
-        super().__init__()
-        self.main_window = main_window
-        self.worker: AutoTestWorker | None = None
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(32, 28, 32, 28)
-        root.setSpacing(16)
-
-        title = QLabel("Автоподбор стратегии")
-        title.setObjectName("pageTitle")
-        subtitle = QLabel(
-            "Приложение по очереди запустит каждую стратегию и проверит доступность "
-            "Discord и YouTube, затем предложит лучший вариант."
-        )
-        subtitle.setObjectName("pageSubtitle")
-        subtitle.setWordWrap(True)
-        root.addWidget(title)
-        root.addWidget(subtitle)
-
-        control_card = Card()
-        self.status_label = QLabel("Готов к запуску")
-        control_card.body.addWidget(self.status_label)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        control_card.body.addWidget(self.progress_bar)
-
-        btn_row = QHBoxLayout()
-        self.start_button = QPushButton("Начать автотест")
-        self.start_button.setObjectName("primaryButton")
-        self.start_button.clicked.connect(self.start_test)
-        self.cancel_button = QPushButton("Отменить")
-        self.cancel_button.setObjectName("secondaryButton")
-        self.cancel_button.clicked.connect(self.cancel_test)
-        self.cancel_button.setEnabled(False)
-        btn_row.addWidget(self.start_button)
-        btn_row.addWidget(self.cancel_button)
-        btn_row.addStretch(1)
-        control_card.body.addLayout(btn_row)
-        root.addWidget(control_card)
-
-        results_label = QLabel("РЕЗУЛЬТАТЫ")
-        results_label.setObjectName("sectionLabel")
-        root.addWidget(results_label)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        self.results_container = QWidget()
-        self.results_layout = QVBoxLayout(self.results_container)
-        self.results_layout.setSpacing(8)
-        self.results_layout.addStretch(1)
-        scroll.setWidget(self.results_container)
-        root.addWidget(scroll, 1)
-
-    @exclusive_action
-    def start_test(self) -> None:
-        if not is_installed():
-            QMessageBox.information(self, "zapret не установлен", "Сначала установите zapret на странице «Обновление».")
-            return
-
-        strategies = discover_strategies()
-        if not strategies:
-            QMessageBox.information(self, "Нет стратегий", "Стратегии не найдены.")
-            return
-
-        self._clear_results()
-        self.start_button.setEnabled(False)
-        self.cancel_button.setEnabled(True)
-        self.progress_bar.setValue(0)
-        self.status_label.setText("Подготовка...")
-
-        self.worker = AutoTestWorker(strategies)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.finished_ok.connect(self._on_finished)
-        self.worker.finished_error.connect(self._on_error)
-        self.main_window.operations.start(self.worker)
-        self.main_window.set_busy(True, "Идёт автотест стратегий...")
-
-    def cancel_test(self) -> None:
-        if self.worker:
-            self.worker.cancel()
-            self.status_label.setText("Останавливаю...")
-
-    def _on_progress(self, msg: str, i: int, total: int) -> None:
-        self.status_label.setText(f"{msg}  ({i}/{total})")
-        self.progress_bar.setValue(int(i / total * 100))
-
-    def _clear_results(self) -> None:
-        for i in reversed(range(self.results_layout.count() - 1)):
-            item = self.results_layout.itemAt(i)
-            w = item.widget()
-            if w:
-                w.setParent(None)
-
-    def _on_finished(self, results: list) -> None:
-        self.start_button.setEnabled(True)
-        self.cancel_button.setEnabled(False)
-        self.status_label.setText("Тестирование завершено")
-        self.progress_bar.setValue(100)
-        self.main_window.set_busy(False)
-
-        if not results:
-            no_res = QLabel("Нет результатов (тест был отменён до первой стратегии).")
-            no_res.setStyleSheet(f"color: {TEXT_SECONDARY};")
-            self.results_layout.insertWidget(0, no_res)
-            return
-
-        state = load_state()
-        state.last_test_results = [
-            {
-                "strategy": r.strategy.file_name,
-                "success": r.success_count,
-                "total": r.total_checks,
-                "avg_latency_ms": r.avg_latency_ms,
-            }
-            for r in results
-        ]
-        save_state(state)
-
-        for rank, result in enumerate(results, start=1):
-            self.results_layout.insertWidget(rank - 1, self._build_result_row(rank, result))
-
-        self.main_window.home_page.reload_strategies()
-
-    def _build_result_row(self, rank: int, result) -> QWidget:
-        card = Card()
-        row = QHBoxLayout()
-
-        best = rank == 1 and result.success_count > 0
-        prefix = "🏆 " if best else f"#{rank}  "
-        name_label = QLabel(f"{prefix}{result.strategy.name}")
-        name_label.setStyleSheet("font-weight: 600;" + (f" color: {SUCCESS};" if best else ""))
-        row.addWidget(name_label)
-        row.addStretch(1)
-
-        latency = f"{result.avg_latency_ms:.0f} мс" if result.avg_latency_ms else "—"
-        info_label = QLabel(f"{result.success_count}/{result.total_checks} проверок · {latency}")
-        info_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
-        row.addWidget(info_label)
-
-        apply_btn = QPushButton("Применить")
-        apply_btn.setObjectName("secondaryButton")
-        apply_btn.clicked.connect(lambda: self._apply_strategy(result.strategy))
-        row.addWidget(apply_btn)
-
-        card.body.addLayout(row)
-        return card
-
-    def _apply_strategy(self, strategy: Strategy) -> None:
-        state = load_state()
-        state.favorite_strategy = strategy.file_name
-        save_state(state)
-        self.main_window.start_strategy(strategy)
-        self.main_window.go_to("home")
-
-    def _on_error(self, message: str) -> None:
-        self.start_button.setEnabled(True)
-        self.cancel_button.setEnabled(False)
-        self.status_label.setText("Ошибка")
-        self.main_window.set_busy(False)
-        QMessageBox.warning(self, "Ошибка автотеста", message)
-
-
-# --------------------------------------------------------------------------- #
-# Обновление
-# --------------------------------------------------------------------------- #
-# --------------------------------------------------------------------------- #
-# Telegram (tg-ws-proxy)
+# Telegram
 # --------------------------------------------------------------------------- #
 class TelegramPage(QWidget):
     """
@@ -1734,13 +1624,38 @@ class SettingsPage(QWidget):
         super().__init__()
         self.main_window = main_window
 
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        root = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         root.setContentsMargins(32, 28, 32, 28)
         root.setSpacing(16)
 
         title = QLabel("Настройки")
         title.setObjectName("pageTitle")
         root.addWidget(title)
+
+        behavior = Card()
+        behavior.body.addWidget(QLabel("Окно и подсказки"))
+        state = load_state()
+        self.preference_checks = {}
+        for key, text in (("close_to_tray", "Крестик сворачивает приложение в трей"),
+                          ("tray_notifications", "Показывать уведомление при сворачивании в трей"),
+                          ("show_quick_start", "Показывать подсказки быстрого старта на главной")):
+            check = QCheckBox(text)
+            check.setChecked(getattr(state, key))
+            check.toggled.connect(lambda value, name=key: self._save_preference(name, value))
+            self.preference_checks[key] = check
+            behavior.body.addWidget(check)
+        hint = QLabel("«Выход» закрывает ZapretDrum. Запущенный обход и Telegram-прокси продолжают работать. "
+                      "Остановить обход можно на главной или через меню трея.")
+        hint.setWordWrap(True)
+        behavior.body.addWidget(hint)
+        root.addWidget(behavior)
 
         update_card = Card()
         update_title = QLabel("ОБНОВЛЕНИЕ ZAPRETDRUM")
@@ -1835,6 +1750,21 @@ class SettingsPage(QWidget):
         root.addWidget(danger_card)
 
         root.addStretch(1)
+
+    def _save_preference(self, key, value) -> None:
+        state = load_state()
+        old = getattr(state, key)
+        setattr(state, key, value)
+        try:
+            save_state(state)
+        except OSError as exc:
+            check = self.preference_checks[key]
+            check.blockSignals(True)
+            check.setChecked(old)
+            check.blockSignals(False)
+            QMessageBox.warning(self, "Настройка не сохранена", str(exc))
+            return
+        self.main_window.apply_preferences(state)
 
     @exclusive_action
     def _check_app_update(self) -> None:
@@ -1996,6 +1926,9 @@ class SettingsPage(QWidget):
             state.installed_version = None
             state.last_strategy = None
             state.last_test_results = []
+            state.last_test_at = None
+            state.last_test_version = None
+            state.last_test_baseline = []
             save_state(state)
             QMessageBox.information(self, "Готово", "zapret удалён.")
         self.main_window.notify_installed()
@@ -2241,6 +2174,12 @@ class MainWindow(QMainWindow):
         self._exit_requested = False
         self._exit_started = False
         self._exit_action = None
+        preferences = load_state()
+        self.close_to_tray = preferences.close_to_tray
+        self.tray_notifications = preferences.tray_notifications
+        self._tray_notice_shown = False
+        self._observed = {"own": {}, "foreign": 0, "unknown": 0, "strategy": None}
+        self._favorite_after_start = None
         self.setWindowTitle("ZapretDrum — обход блокировок Discord/YouTube")
         self.resize(1120, 680)
         self.setStyleSheet(STYLESHEET)
@@ -2263,6 +2202,19 @@ class MainWindow(QMainWindow):
         exit_action = QAction("Выход", self)
         exit_action.triggered.connect(self.request_exit)
         tray_menu.addAction(open_action)
+        self.tray_status_action = QAction("Проверка состояния…", self)
+        self.tray_status_action.setEnabled(False)
+        tray_menu.addAction(self.tray_status_action)
+        self.tray_toggle_action = QAction("Запустить обход", self)
+        self.tray_toggle_action.triggered.connect(lambda: self.home_page._on_power_clicked())
+        tray_menu.addAction(self.tray_toggle_action)
+        telegram_action = QAction("Telegram", self)
+        telegram_action.triggered.connect(lambda: (self._restore_from_tray(), self.go_to("telegram")))
+        tray_menu.addAction(telegram_action)
+        diagnostics_action = QAction("Диагностика", self)
+        diagnostics_action.triggered.connect(lambda: (self._restore_from_tray(), self.go_to("diagnostics")))
+        tray_menu.addAction(diagnostics_action)
+        tray_menu.aboutToShow.connect(self._refresh_tray_actions)
         tray_menu.addSeparator()
         tray_menu.addAction(exit_action)
         self.tray_icon.setContextMenu(tray_menu)
@@ -2420,8 +2372,7 @@ class MainWindow(QMainWindow):
         self.status_timer.start(2000)
         self._refresh_status()
 
-        if not is_installed():
-            self.go_to("update")
+        # The home card guides installation through the existing update page.
 
         QTimer.singleShot(600, self._check_zapret_conflicts)
 
@@ -2494,6 +2445,8 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.pages[key])
         if key == "autotest" and auto_start:
             self.autotest_page.start_test()
+        elif key == "autotest" and not self.operations.active:
+            self.autotest_page.reload_saved()
         if key == "domains" and not self.operations.active:
             self.domains_page.reload()
         if key == "telegram" and not self.operations.active:
@@ -2512,6 +2465,8 @@ class MainWindow(QMainWindow):
             page.setEnabled(enabled or page is self.autotest_page and owner is page)
         self.version_btn.setEnabled(enabled)
         self.autotest_page.results_container.setEnabled(enabled)
+        self.autotest_page.baseline_button.setEnabled(enabled)
+        self._refresh_tray_actions()
         if not enabled:
             self.status_timer.stop()
         else:
@@ -2582,7 +2537,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ #
     @exclusive_action
-    def start_strategy(self, strategy: Strategy) -> None:
+    def start_strategy(self, strategy: Strategy, make_favorite: bool = False) -> None:
         if not process_manager.IS_WINDOWS:
             QMessageBox.warning(
                 self, "Только Windows",
@@ -2590,6 +2545,12 @@ class MainWindow(QMainWindow):
             )
             return
 
+        if service_manager.get_service_status() == "running" and service_manager.service_belongs_to_install("zapret"):
+            if not _confirm(self, "Переключить стратегию?",
+                            "Работающая служба будет остановлена, а выбранная стратегия запущена обычным способом. "
+                            "Настройка автозапуска службы останется прежней. Чтобы изменить её, используйте «Установить как службу»."):
+                return
+        self._favorite_after_start = strategy.file_name if make_favorite else None
         self.set_busy(True, f"Запускаю {strategy.name}...")
         self.start_worker = StartStrategyWorker(strategy)
         self.start_worker.finished_ok.connect(self._on_start_ok)
@@ -2599,9 +2560,13 @@ class MainWindow(QMainWindow):
     def _on_start_ok(self, file_name: str) -> None:
         state = load_state()
         state.last_strategy = file_name
+        if self._favorite_after_start == file_name:
+            state.favorite_strategy = file_name
+        self._favorite_after_start = None
         save_state(state)
         self.set_busy(False)
-        self._refresh_status()
+        self.home_page.selected_file_name = file_name
+        self.home_page.reload_strategies()
 
     @exclusive_action
     def stop_strategy(self) -> None:
@@ -2614,6 +2579,7 @@ class MainWindow(QMainWindow):
         self.operations.start(self.stop_worker)
 
     def _on_worker_error(self, message: str) -> None:
+        self._favorite_after_start = None
         self.set_busy(False)
         self.home_page.power_button.set_busy(False)
         QMessageBox.warning(self, "Ошибка", message)
@@ -2621,9 +2587,31 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def _refresh_status(self) -> None:
         observed = process_manager.inspect_processes()
+        self._observed = observed
         self.home_page.refresh(bool(observed["own"]), observed["strategy"], observed["foreign"], observed["unknown"])
+        self._refresh_tray_actions()
         if self.stack.currentWidget() is self.telegram_page:
             self.telegram_page.refresh()
+
+    def _refresh_tray_actions(self) -> None:
+        running = bool(self._observed["own"])
+        busy = self.operations.active or self._exit_requested
+        status = "Выполняется операция…" if busy else ("Обход запущен" if running else "Обход не запущен")
+        if self._observed["unknown"] and not busy:
+            status = "Состояние обхода не определено"
+        self.tray_status_action.setText(status)
+        self.tray_icon.setToolTip("ZapretDrum — " + status)
+        self.tray_toggle_action.setText("Остановить обход" if running else "Запустить обход")
+        self.tray_toggle_action.setEnabled(not busy and not self._observed["unknown"])
+
+    def apply_preferences(self, state) -> None:
+        self.close_to_tray = state.close_to_tray
+        self.tray_notifications = state.tray_notifications
+        for key, check in self.settings_page.preference_checks.items():
+            check.blockSignals(True)
+            check.setChecked(getattr(state, key))
+            check.blockSignals(False)
+        self._refresh_status()
 
     # ------------------------------------------------------------------ #
     # ------------------------------------------------------------------ #
@@ -2632,15 +2620,13 @@ class MainWindow(QMainWindow):
         if self._exit_started:
             event.accept()
             return
-        if self.tray_icon.isVisible() and QSystemTrayIcon.isSystemTrayAvailable():
+        if self.close_to_tray and self.tray_icon.isVisible() and QSystemTrayIcon.isSystemTrayAvailable():
             event.ignore()
             self.hide()
-            self.tray_icon.showMessage(
-                "ZapretDrum",
-                "Приложение продолжает работать в системном трее.",
-                QSystemTrayIcon.MessageIcon.Information,
-                2500,
-            )
+            if self.tray_notifications and not self._tray_notice_shown:
+                self.tray_icon.showMessage("ZapretDrum", "Приложение продолжает работать в системном трее.",
+                                           QSystemTrayIcon.MessageIcon.Information, 2500)
+                self._tray_notice_shown = True
             return
         event.ignore()
         self.request_exit()

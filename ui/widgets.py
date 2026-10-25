@@ -88,6 +88,7 @@ class StrategyRow(QWidget):
     def __init__(self, name: str, file_name: str, parent: QWidget | None = None):
         super().__init__(parent)
         self.file_name = file_name
+        self.setAccessibleName("Стратегия " + name)
         self.setObjectName("strategyRow")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setMinimumHeight(56)
@@ -118,9 +119,23 @@ class StrategyRow(QWidget):
 
         self._active = False
         self._selected = False
+        self._favorite = False
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def set_favorite(self, favorite: bool) -> None:
+        self._favorite = favorite
+        self._restyle()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.clicked.emit(self.file_name)
+            event.accept()
+        else:
+            super().keyPressEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
-        self.clicked.emit(self.file_name)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.file_name)
         super().mousePressEvent(event)
 
     def set_ping_text(self, text: str, ok: bool | None) -> None:
@@ -143,15 +158,21 @@ class StrategyRow(QWidget):
         self._restyle()
 
     def _restyle(self) -> None:
-        highlighted = self._active or self._selected
-        self.setObjectName("strategyRowActive" if highlighted else "strategyRow")
+        self.setObjectName("strategyRowActive" if self._active else ("strategyRowSelected" if self._selected else "strategyRow"))
         self.style().unpolish(self)
         self.style().polish(self)
+        badges = []
         if self._active:
-            self.type_label.setText("● РАБОТАЕТ СЕЙЧАС")
+            badges.append("● РАБОТАЕТ")
+        if self._selected:
+            badges.append("ВЫБРАНА")
+        if self._favorite:
+            badges.append("★ ИЗБРАННАЯ")
+        self.type_label.setText(" · ".join(badges) if badges else "ZAPRET | BAT")
+        self.type_label.setWordWrap(True)
+        if self._active:
             self.type_label.setStyleSheet(f"color: {SUCCESS}; font-size: 10px; font-weight: 700;")
         else:
-            self.type_label.setText("ZAPRET | BAT")
             self.type_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; letter-spacing: 0.5px;")
 
 
@@ -170,6 +191,15 @@ class PowerButton(QWidget):
         self._connected = False
         self._busy = False
         self._unknown = False
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAccessibleName("Запустить или остановить обход")
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.clicked.emit()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
 
     def set_unknown(self, unknown: bool) -> None:
         self._unknown = unknown
@@ -201,6 +231,8 @@ class PowerButton(QWidget):
 
         # внешнее тонкое кольцо
         ring_pen = QPen(main_color if self._connected else QColor(BG_ELEVATED))
+        if self.hasFocus():
+            ring_pen = QPen(QColor(TEXT_PRIMARY))
         ring_pen.setWidthF(1.5)
         painter.setPen(ring_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)

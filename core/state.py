@@ -28,6 +28,12 @@ class AppState:
     last_strategy: Optional[str] = None
     favorite_strategy: Optional[str] = None
     last_test_results: list[dict[str, Any]] = field(default_factory=list)
+    last_test_at: Optional[str] = None
+    last_test_version: Optional[str] = None
+    last_test_baseline: list[dict[str, Any]] = field(default_factory=list)
+    close_to_tray: bool = True
+    tray_notifications: bool = True
+    show_quick_start: bool = True
     autostart_enabled: bool = False
     tg_installed_version: Optional[str] = None
     zapret_conflict_dismissed: bool = False
@@ -35,6 +41,20 @@ class AppState:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _valid_checks(value) -> bool:
+    if not isinstance(value, list):
+        return False
+    for item in value:
+        if not isinstance(item, dict):
+            return False
+        latency = item.get("latency_ms")
+        if (not isinstance(item.get("name"), str) or type(item.get("ok")) is not bool
+                or not (item.get("error") is None or isinstance(item["error"], str))
+                or not (latency is None or type(latency) in (int, float) and math.isfinite(latency) and latency >= 0)):
+            return False
+    return True
 
 
 def _decode(raw: bytes) -> AppState:
@@ -50,6 +70,8 @@ def _decode(raw: bytes) -> AppState:
             valid = value is None or isinstance(value, str)
         elif isinstance(expected, bool):
             valid = isinstance(value, bool)
+        elif key == "last_test_baseline":
+            valid = _valid_checks(value)
         else:
             valid = isinstance(value, list) and all(isinstance(item, dict) for item in value)
             if valid:
@@ -59,7 +81,8 @@ def _decode(raw: bytes) -> AppState:
                              and type(item.get("success")) is int and type(item.get("total")) is int
                              and 0 <= item["success"] <= item["total"]
                              and (latency is None or type(latency) in (int, float)
-                                  and math.isfinite(latency) and latency >= 0))
+                                  and math.isfinite(latency) and latency >= 0)
+                             and ("checks" not in item or _valid_checks(item["checks"])))
                     if not valid:
                         break
         if not valid:

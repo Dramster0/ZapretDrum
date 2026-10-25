@@ -464,6 +464,9 @@ def _apply_prepared_install(src_root: Path, job_dir: Path, release: ReleaseInfo,
         else:
             state.installed_version = release.tag_name
             state.last_test_results = []
+            state.last_test_at = None
+            state.last_test_version = None
+            state.last_test_baseline = []
         save_state(state)
         recovery.finish_transaction()
     except OSError as exc:

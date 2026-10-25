@@ -19,7 +19,8 @@ from core.diagnostic_log import logger
 
 RECOVERY_DIR = APP_DATA_DIR / "recovery"
 TRANSACTION_FILE = RECOVERY_DIR / "transaction.json"
-COMPONENT_FIELDS = ("installed_version", "last_strategy", "favorite_strategy", "last_test_results")
+COMPONENT_FIELDS = ("installed_version", "last_strategy", "favorite_strategy", "last_test_results",
+                    "last_test_at", "last_test_version", "last_test_baseline")
 
 
 @dataclass

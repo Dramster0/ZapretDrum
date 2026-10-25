@@ -1,4 +1,5 @@
 from __future__ import annotations
+from threading import Event
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -9,7 +10,7 @@ from core import tg_manager
 from core import tg_installer
 from core.installer import install_or_update, fetch_all_releases, InstallerError, ReleaseInfo
 from core.strategies import Strategy
-from core.tester import run_auto_test, StrategyTestResult
+from core.tester import run_auto_test
 
 
 class CallWorker(QThread):
@@ -72,13 +73,31 @@ class StartStrategyWorker(QThread):
         self.strategy = strategy
 
     def run(self) -> None:
+        service_was_running = False
         try:
+            service_status, service_error = service_manager.get_service_status_details()
+            if service_status == "unknown":
+                raise process_manager.ProcessManagerError(service_error + " Откройте диагностику.")
+            if service_manager.service_belongs_to_install("zapret"):
+                if service_status == "running":
+                    service_was_running = True
+                    service_manager.set_owned_service_running(False)
+                elif service_status.endswith("_pending"):
+                    raise process_manager.ProcessManagerError("Служба меняет состояние. Повторите запуск позже.")
+                elif service_status != "stopped":
+                    raise process_manager.ProcessManagerError("Служба не остановлена: " + service_status)
             process_manager.start_strategy(self.strategy)
             self.finished_ok.emit(self.strategy.file_name)
-        except process_manager.ProcessManagerError as exc:
-            self.finished_error.emit(str(exc))
-        except Exception as exc:  # noqa: BLE001
-            self.finished_error.emit(f"Непредвиденная ошибка: {exc}")
+        except Exception as exc:
+            message = str(exc)
+            if service_was_running:
+                try:
+                    process_manager.stop_all()
+                    service_manager.set_owned_service_running(True)
+                    message += "\nПрежняя служба запущена снова."
+                except Exception as restore_error:
+                    message += "\nНе удалось восстановить службу: " + str(restore_error)
+            self.finished_error.emit(message)
 
 
 class StopWorker(QThread):
@@ -87,6 +106,8 @@ class StopWorker(QThread):
 
     def run(self) -> None:
         try:
+            if service_manager.service_belongs_to_install("zapret"):
+                service_manager.set_owned_service_running(False)
             process_manager.stop_all()
             self.finished_ok.emit()
         except process_manager.ProcessManagerError as exc:
@@ -97,23 +118,23 @@ class StopWorker(QThread):
 
 class AutoTestWorker(QThread):
     progress = pyqtSignal(str, int, int)
-    finished_ok = pyqtSignal(list)     # list[StrategyTestResult]
+    finished_ok = pyqtSignal(object)
     finished_error = pyqtSignal(str)
 
     def __init__(self, strategies: list[Strategy]):
         super().__init__()
         self.strategies = strategies
-        self._cancelled = False
+        self._cancelled = Event()
 
     def cancel(self) -> None:
-        self._cancelled = True
+        self._cancelled.set()
 
     def run(self) -> None:
         try:
-            results: list[StrategyTestResult] = run_auto_test(
+            results = run_auto_test(
                 self.strategies,
                 progress_cb=lambda msg, i, total: self.progress.emit(msg, i, total),
-                cancel_cb=lambda: self._cancelled,
+                cancel_cb=self._cancelled.is_set,
             )
             self.finished_ok.emit(results)
         except Exception as exc:  # noqa: BLE001
