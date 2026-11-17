@@ -895,8 +895,7 @@ class TelegramPage(QWidget):
     Отдельная вкладка для tg-ws-proxy (Flowseal/tg-ws-proxy) - локального
     MTProto-прокси, ускоряющего Telegram. Это отдельная программа того же
     автора: скачивание/установка идёт через core.tg_installer, запуск и
-    статус - через core.tg_manager. Обновления самого tg-ws-proxy делаются
-    на странице «Обновление» (отдельным блоком) - здесь только состояние,
+    статус - через core.tg_manager. Здесь же доступны обновление,
     запуск/остановка и автозапуск.
     """
 
@@ -907,9 +906,18 @@ class TelegramPage(QWidget):
         self.start_worker: TgStartWorker | None = None
         self.stop_worker: TgStopWorker | None = None
 
-        root = QVBoxLayout(self)
+        # Preserve the cards' required height; scroll instead of squeezing
+        # wrapped descriptions and buttons when the window is short.
+        page_layout = QVBoxLayout(self)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        root = QVBoxLayout(content)
         root.setContentsMargins(32, 28, 32, 28)
         root.setSpacing(16)
+        scroll.setWidget(content)
+        page_layout.addWidget(scroll)
 
         title = QLabel("Telegram")
         title.setObjectName("pageTitle")
@@ -979,8 +987,7 @@ class TelegramPage(QWidget):
         self.status_card.body.addLayout(control_row)
         root.addWidget(self.status_card)
 
-        # --- карточка обновления (проверить/скачать новую версию, не уходя
-        # с вкладки - то же самое, что и блок на странице «Обновление») --- #
+        # --- карточка обновления tg-ws-proxy --- #
         self.tg_update_card = Card()
         update_title = QLabel("Обновление tg-ws-proxy")
         update_title.setStyleSheet("font-weight: 600;")
@@ -1031,19 +1038,15 @@ class TelegramPage(QWidget):
         autostart_title = QLabel("Автозапуск")
         autostart_title.setStyleSheet("font-weight: 600;")
         autostart_hint = QLabel(
-            "tg-ws-proxy - трей-приложение, а не консольная стратегия, поэтому "
-            "автозапуск делается не службой Windows (у службы нет доступа к "
-            "рабочему столу и трею), а через папку автозагрузки Windows: "
-            "программа запускается скрыто при входе в систему, вместе с "
-            "остальными трей-приложениями."
+            "При включённом автозапуске tg-ws-proxy запускается в трее "
+            "при входе в Windows. Открывать ZapretDrum для этого не нужно."
         )
         autostart_hint.setWordWrap(True)
         autostart_hint.setStyleSheet(f"color: {TEXT_SECONDARY};")
 
         autostart_row = QHBoxLayout()
         self.autostart_status_label = QLabel("Автозапуск: выключен")
-        autostart_row.addWidget(self.autostart_status_label)
-        autostart_row.addStretch(1)
+        self.autostart_status_label.setWordWrap(True)
         self.autostart_enable_btn = QPushButton("Включить автозапуск")
         self.autostart_enable_btn.setObjectName("secondaryButton")
         self.autostart_enable_btn.clicked.connect(self._on_enable_autostart)
@@ -1052,9 +1055,11 @@ class TelegramPage(QWidget):
         self.autostart_disable_btn.clicked.connect(self._on_disable_autostart)
         autostart_row.addWidget(self.autostart_enable_btn)
         autostart_row.addWidget(self.autostart_disable_btn)
+        autostart_row.addStretch(1)
 
         autostart_card.body.addWidget(autostart_title)
         autostart_card.body.addWidget(autostart_hint)
+        autostart_card.body.addWidget(self.autostart_status_label)
         autostart_card.body.addLayout(autostart_row)
         root.addWidget(autostart_card)
 
